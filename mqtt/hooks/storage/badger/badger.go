@@ -15,7 +15,7 @@ import (
 	"github.com/wind-c/comqtt/v2/mqtt/packets"
 	"github.com/wind-c/comqtt/v2/mqtt/system"
 
-	"github.com/timshannon/badgerhold"
+	badgerhold "github.com/timshannon/badgerhold/v4"
 )
 
 const (

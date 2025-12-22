@@ -184,6 +184,7 @@ func New(opts *Options) *Server {
 		hooks: &Hooks{
 			Log: opts.Logger,
 		},
+		TopicToStats: make(map[string]int64),
 	}
 
 	stats := s.sampleStatistics()

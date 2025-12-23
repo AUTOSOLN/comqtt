@@ -283,7 +283,7 @@ func (s *Server) AddListener(l listeners.Listener) error {
 // Serve starts the event loops responsible for establishing client connections
 // on all attached listeners, publishing the system topics, and starting all hooks.
 func (s *Server) Serve() error {
-	defer s.Log.Info("server started", slog.String("version", s.Info.Version))
+	defer s.Log.Info("server started")
 
 	if s.hooks.Provides(
 		StoredClients,

@@ -1430,7 +1430,7 @@ func (s *Server) sampleStatistics() map[string]int64 {
 	stats := map[string]int64{
 		"/broker/started":                   startTime,
 		"/broker/time":                      currentTime,
-		"/broker/uptime":                    startTime - currentTime,
+		"/broker/uptime":                    currentTime - startTime,
 		"/broker/load/bytes/received":       atomic.LoadInt64(&s.Info.BytesReceived),
 		"/broker/load/bytes/sent":           atomic.LoadInt64(&s.Info.BytesSent),
 		"/broker/clients/connected":         clientsConnected,

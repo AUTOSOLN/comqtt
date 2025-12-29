@@ -8,6 +8,7 @@ package mqtt
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"net"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -118,17 +120,19 @@ type Options struct {
 // Server is an MQTT broker server. It should be created with server.New()
 // in order to ensure all the internal fields are correctly populated.
 type Server struct {
-	Options      *Options             // configurable server options
-	Listeners    *listeners.Listeners // listeners are network interfaces which listen for new connections
-	Clients      *Clients             // clients known to the broker
-	Topics       *TopicsIndex         // an index of topic filter subscriptions and retained messages
-	Info         *system.Info         // values about the server commonly known as $SYS topics
-	loop         *loop                // loop contains tickers for the system event loop
-	done         chan bool            // indicate that the server is ending
-	Log          *slog.Logger         // minimal no-alloc logger
-	hooks        *Hooks               // hooks contains hooks for extra functionality such as auth and persistent storage
-	inlineClient *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
-	Blacklist    []string             // blacklist of client id
+	Options        *Options             // configurable server options
+	Listeners      *listeners.Listeners // listeners are network interfaces which listen for new connections
+	Clients        *Clients             // clients known to the broker
+	Topics         *TopicsIndex         // an index of topic filter subscriptions and retained messages
+	Info           *system.Info         // values about the server commonly known as $SYS topics
+	loop           *loop                // loop contains tickers for the system event loop
+	done           chan bool            // indicate that the server is ending
+	Log            *slog.Logger         // minimal no-alloc logger
+	hooks          *Hooks               // hooks contains hooks for extra functionality such as auth and persistent storage
+	inlineClient   *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
+	Blacklist      []string             // blacklist of client id
+	TopicToStats   map[string]int64     // $SYS topic to statistics lookup
+	TopicToStatsMu sync.Mutex
 }
 
 // loop contains interval tickers for the system events loop.
@@ -180,7 +184,11 @@ func New(opts *Options) *Server {
 		hooks: &Hooks{
 			Log: opts.Logger,
 		},
+		TopicToStats: make(map[string]int64),
 	}
+
+	stats := s.sampleStatistics()
+	s.safeAssignNewStats(&stats)
 
 	if s.Options.InlineClient {
 		s.inlineClient = s.NewClient(nil, LocalListener, InlineClientId, true)
@@ -275,7 +283,7 @@ func (s *Server) AddListener(l listeners.Listener) error {
 // Serve starts the event loops responsible for establishing client connections
 // on all attached listeners, publishing the system topics, and starting all hooks.
 func (s *Server) Serve() error {
-	defer s.Log.Info("server started", slog.String("version", s.Info.Version))
+	defer s.Log.Info("server started")
 
 	if s.hooks.Provides(
 		StoredClients,
@@ -1409,54 +1417,78 @@ func (s *Server) DisconnectClient(cl *Client, code packets.Code) error {
 	return err
 }
 
+func (s *Server) sampleStatistics() map[string]int64 {
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	startTime := atomic.LoadInt64(&s.Info.Started)
+	currentTime := time.Now().Unix()
+	clientsConnected := atomic.LoadInt64(&s.Info.ClientsConnected)
+	clientsTotal := int64(s.Clients.Len())
+	clientsDisconnected := clientsTotal - clientsConnected
+
+	stats := map[string]int64{
+		"/broker/started":                   startTime,
+		"/broker/time":                      currentTime,
+		"/broker/uptime":                    currentTime - startTime,
+		"/broker/load/bytes/received":       atomic.LoadInt64(&s.Info.BytesReceived),
+		"/broker/load/bytes/sent":           atomic.LoadInt64(&s.Info.BytesSent),
+		"/broker/clients/connected":         clientsConnected,
+		"/broker/clients/disconnected":      clientsDisconnected,
+		"/broker/clients/maximum":           atomic.LoadInt64(&s.Info.ClientsMaximum),
+		"/broker/clients/total":             clientsTotal,
+		"/broker/messages/received":         atomic.LoadInt64(&s.Info.MessagesReceived),
+		"/broker/messages/sent":             atomic.LoadInt64(&s.Info.MessagesSent),
+		"/broker/messages/dropped":          atomic.LoadInt64(&s.Info.MessagesDropped),
+		"/broker/retained":                  atomic.LoadInt64(&s.Info.Retained),
+		"/broker/messages/inflight/current": atomic.LoadInt64(&s.Info.Inflight),
+		"/broker/messages/inflight/dropped": atomic.LoadInt64(&s.Info.InflightDropped),
+		"/broker/subscriptions":             atomic.LoadInt64(&s.Info.Subscriptions),
+		"/broker/packets/received":          atomic.LoadInt64(&s.Info.PacketsReceived),
+		"/broker/packets/sent":              atomic.LoadInt64(&s.Info.PacketsSent),
+		"/broker/system/memory":             int64(m.HeapInuse),
+		"/broker/system/threads":            int64(runtime.NumGoroutine()),
+	}
+
+	return stats
+}
+
+// The function returns the 'old' topic-to-statistics map.
+func (s *Server) safeAssignNewStats(newStats *map[string]int64) map[string]int64 {
+	s.TopicToStatsMu.Lock()
+	defer s.TopicToStatsMu.Unlock()
+	oldStats := maps.Clone(s.TopicToStats)
+	maps.Copy(s.TopicToStats, *newStats)
+	return oldStats
+}
+
 // publishSysTopics publishes the current values to the server $SYS topics.
 // Due to the int to string conversions this method is not as cheap as
 // some of the others so the publishing interval should be set appropriately.
 func (s *Server) publishSysTopics() {
-	pk := packets.Packet{
-		FixedHeader: packets.FixedHeader{
-			Type:   packets.Publish,
-			Retain: true,
-		},
-		Created: time.Now().Unix(),
+	nowTopicToStats := s.sampleStatistics()
+	prevTopicToStats := s.safeAssignNewStats(&nowTopicToStats)
+
+	toRbeTopicToStats := make(map[string]int64)
+	for topic, nowStatistic := range nowTopicToStats {
+		prevStatistic := prevTopicToStats[topic]
+		if nowStatistic != prevStatistic {
+			toRbeTopicToStats[topic] = nowStatistic
+		}
 	}
 
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	atomic.StoreInt64(&s.Info.MemoryAlloc, int64(m.HeapInuse))
-	atomic.StoreInt64(&s.Info.Threads, int64(runtime.NumGoroutine()))
-	atomic.StoreInt64(&s.Info.Time, time.Now().Unix())
-	atomic.StoreInt64(&s.Info.Uptime, time.Now().Unix()-atomic.LoadInt64(&s.Info.Started))
-	atomic.StoreInt64(&s.Info.ClientsTotal, int64(s.Clients.Len()))
-	atomic.StoreInt64(&s.Info.ClientsDisconnected, atomic.LoadInt64(&s.Info.ClientsTotal)-atomic.LoadInt64(&s.Info.ClientsConnected))
+	for topicToRbe, statToRbe := range toRbeTopicToStats {
+		pk := packets.Packet{
+			FixedHeader: packets.FixedHeader{
+				Type:   packets.Publish,
+				Retain: false,
+				Qos:    1,
+			},
+			Created:   time.Now().Unix(),
+			Payload:   []byte(strconv.FormatInt(statToRbe, 10)),
+			TopicName: SysPrefix + topicToRbe,
+		}
 
-	topics := map[string]string{
-		SysPrefix + "/broker/version":              s.Info.Version,
-		SysPrefix + "/broker/time":                 AtomicItoa(&s.Info.Time),
-		SysPrefix + "/broker/uptime":               AtomicItoa(&s.Info.Uptime),
-		SysPrefix + "/broker/started":              AtomicItoa(&s.Info.Started),
-		SysPrefix + "/broker/load/bytes/received":  AtomicItoa(&s.Info.BytesReceived),
-		SysPrefix + "/broker/load/bytes/sent":      AtomicItoa(&s.Info.BytesSent),
-		SysPrefix + "/broker/clients/connected":    AtomicItoa(&s.Info.ClientsConnected),
-		SysPrefix + "/broker/clients/disconnected": AtomicItoa(&s.Info.ClientsDisconnected),
-		SysPrefix + "/broker/clients/maximum":      AtomicItoa(&s.Info.ClientsMaximum),
-		SysPrefix + "/broker/clients/total":        AtomicItoa(&s.Info.ClientsTotal),
-		SysPrefix + "/broker/packets/received":     AtomicItoa(&s.Info.PacketsReceived),
-		SysPrefix + "/broker/packets/sent":         AtomicItoa(&s.Info.PacketsSent),
-		SysPrefix + "/broker/messages/received":    AtomicItoa(&s.Info.MessagesReceived),
-		SysPrefix + "/broker/messages/sent":        AtomicItoa(&s.Info.MessagesSent),
-		SysPrefix + "/broker/messages/dropped":     AtomicItoa(&s.Info.MessagesDropped),
-		SysPrefix + "/broker/messages/inflight":    AtomicItoa(&s.Info.Inflight),
-		SysPrefix + "/broker/retained":             AtomicItoa(&s.Info.Retained),
-		SysPrefix + "/broker/subscriptions":        AtomicItoa(&s.Info.Subscriptions),
-		SysPrefix + "/broker/system/memory":        AtomicItoa(&s.Info.MemoryAlloc),
-		SysPrefix + "/broker/system/threads":       AtomicItoa(&s.Info.Threads),
-	}
-
-	for topic, payload := range topics {
-		pk.TopicName = topic
-		pk.Payload = []byte(payload)
-		s.Topics.RetainMessage(pk.Copy(false))
 		s.publishToSubscribers(pk)
 	}
 

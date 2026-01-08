@@ -40,7 +40,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-replace github.com/timshannon/badgerhold/v4 => github.com/johnlaird-caff/badgerhold/v4 v4.0.0-20251204192333-c046de445552
+replace github.com/timshannon/badgerhold/v4 => github.com/AUTOSOLN/badgerhold/v4 v4.0.0-20251211195720-91f2412f78bb
 
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect

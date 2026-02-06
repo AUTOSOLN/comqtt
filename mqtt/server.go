@@ -25,6 +25,7 @@ import (
 	"github.com/wind-c/comqtt/v2/mqtt/listeners"
 	"github.com/wind-c/comqtt/v2/mqtt/packets"
 	"github.com/wind-c/comqtt/v2/mqtt/system"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 
 	"log/slog"
 )
@@ -107,7 +108,7 @@ type Options struct {
 	// 	Level: level,
 	// }))
 	// level.Set(slog.LevelDebug)
-	Logger *slog.Logger
+	Logger *safelogger.SafeLogger
 
 	// SysTopicResendInterval specifies the interval between $SYS topic updates in seconds.
 	SysTopicResendInterval int64 `yaml:"sys-topic-resend-interval"`
@@ -120,18 +121,18 @@ type Options struct {
 // Server is an MQTT broker server. It should be created with server.New()
 // in order to ensure all the internal fields are correctly populated.
 type Server struct {
-	Options        *Options             // configurable server options
-	Listeners      *listeners.Listeners // listeners are network interfaces which listen for new connections
-	Clients        *Clients             // clients known to the broker
-	Topics         *TopicsIndex         // an index of topic filter subscriptions and retained messages
-	Info           *system.Info         // values about the server commonly known as $SYS topics
-	loop           *loop                // loop contains tickers for the system event loop
-	done           chan bool            // indicate that the server is ending
-	Log            *slog.Logger         // minimal no-alloc logger
-	hooks          *Hooks               // hooks contains hooks for extra functionality such as auth and persistent storage
-	inlineClient   *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
-	Blacklist      []string             // blacklist of client id
-	TopicToStats   map[string]int64     // $SYS topic to statistics lookup
+	Options        *Options               // configurable server options
+	Listeners      *listeners.Listeners   // listeners are network interfaces which listen for new connections
+	Clients        *Clients               // clients known to the broker
+	Topics         *TopicsIndex           // an index of topic filter subscriptions and retained messages
+	Info           *system.Info           // values about the server commonly known as $SYS topics
+	loop           *loop                  // loop contains tickers for the system event loop
+	done           chan bool              // indicate that the server is ending
+	Log            *safelogger.SafeLogger // minimal no-alloc logger
+	hooks          *Hooks                 // hooks contains hooks for extra functionality such as auth and persistent storage
+	inlineClient   *Client                // inlineClient is a special client used for inline subscriptions and inline Publish
+	Blacklist      []string               // blacklist of client id
+	TopicToStats   map[string]int64       // $SYS topic to statistics lookup
 	TopicToStatsMu sync.Mutex
 }
 
@@ -147,10 +148,10 @@ type loop struct {
 
 // ops contains server values which can be propagated to other structs.
 type ops struct {
-	options *Options     // a pointer to the server options and capabilities, for referencing in clients
-	info    *system.Info // pointers to server system info
-	hooks   *Hooks       // pointer to the server hooks
-	log     *slog.Logger // a structured logger for the client
+	options *Options               // a pointer to the server options and capabilities, for referencing in clients
+	info    *system.Info           // pointers to server system info
+	hooks   *Hooks                 // pointer to the server hooks
+	log     *safelogger.SafeLogger // a structured logger for the client
 }
 
 // New returns a new instance of comqtt broker. Optional parameters
@@ -220,7 +221,7 @@ func (o *Options) ensureDefaults() {
 
 	if o.Logger == nil {
 		log := slog.New(slog.NewTextHandler(os.Stdout, nil))
-		o.Logger = log
+		o.Logger = safelogger.NewSafeLogger(log)
 	}
 }
 
@@ -254,8 +255,7 @@ func (s *Server) NewClient(c net.Conn, listener string, id string, inline bool) 
 // AddHook attaches a new Hook to the server. Ideally, this should be called
 // before the server is started with s.Serve().
 func (s *Server) AddHook(hook Hook, config any) error {
-	nl := s.Log.With("hook", hook.ID())
-	hook.SetOpts(nl, &HookOptions{
+	hook.SetOpts(s.Log, &HookOptions{
 		Capabilities: s.Options.Capabilities,
 	})
 
@@ -269,8 +269,7 @@ func (s *Server) AddListener(l listeners.Listener) error {
 		return ErrListenerIDExists
 	}
 
-	nl := s.Log.With(slog.String("listener", l.ID()))
-	err := l.Init(nl)
+	err := l.Init(s.Log)
 	if err != nil {
 		return err
 	}

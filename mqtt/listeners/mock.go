@@ -9,7 +9,7 @@ import (
 	"net"
 	"sync"
 
-	"log/slog"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
 // MockEstablisher is a function signature which can be used in testing.
@@ -53,7 +53,7 @@ func (l *MockListener) Serve(establisher EstablishFn) {
 }
 
 // Init initializes the listener.
-func (l *MockListener) Init(log *slog.Logger) error {
+func (l *MockListener) Init(log *safelogger.SafeLogger) error {
 	if l.ErrListen {
 		return fmt.Errorf("listen failure")
 	}

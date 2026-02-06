@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+
 	"github.com/stretchr/testify/require"
 	"github.com/wind-c/comqtt/v2/mqtt"
 	"github.com/wind-c/comqtt/v2/mqtt/packets"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
-var logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+var logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 
 // func teardown(t *testing.T, path string, h *Hook) {
 // 	h.Stop()

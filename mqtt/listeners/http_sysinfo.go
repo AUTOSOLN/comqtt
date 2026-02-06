@@ -8,13 +8,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/wind-c/comqtt/v2/mqtt/system"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
 // HTTPStats is a listener for presenting the server $SYS stats on a JSON http endpoint.
@@ -76,7 +76,7 @@ func (l *HTTPStats) Protocol() string {
 }
 
 // Init initializes the listener.
-func (l *HTTPStats) Init(_ *slog.Logger) error {
+func (l *HTTPStats) Init(_ *safelogger.SafeLogger) error {
 	mux := http.NewServeMux()
 	if len(l.handlers) > 0 {
 		for path, handler := range l.handlers {

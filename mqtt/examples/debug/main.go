@@ -15,6 +15,7 @@ import (
 	"github.com/wind-c/comqtt/v2/mqtt/hooks/auth"
 	"github.com/wind-c/comqtt/v2/mqtt/hooks/debug"
 	"github.com/wind-c/comqtt/v2/mqtt/listeners"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
 func main() {
@@ -29,9 +30,9 @@ func main() {
 	server := mqtt.New(nil)
 
 	level := new(slog.LevelVar)
-	server.Log = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+	server.Log = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: level,
-	}))
+	})))
 	level.Set(slog.LevelDebug)
 
 	err := server.AddHook(new(debug.Hook), &debug.Options{

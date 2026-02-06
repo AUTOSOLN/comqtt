@@ -14,12 +14,13 @@ import (
 	"log/slog"
 
 	"github.com/stretchr/testify/require"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
 const testAddr = ":22222"
 
 var (
-	logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 
 	testCertificate = []byte(`-----BEGIN CERTIFICATE-----
 MIIB/zCCAWgCCQDm3jV+lSF1AzANBgkqhkiG9w0BAQsFADBEMQswCQYDVQQGEwJB

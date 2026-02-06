@@ -14,9 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"log/slog"
-
 	"github.com/gorilla/websocket"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
 var (
@@ -27,14 +26,14 @@ var (
 // Websocket is a listener for establishing websocket connections.
 type Websocket struct { // [MQTT-4.2.0-1]
 	sync.RWMutex
-	id        string              // the internal id of the listener
-	address   string              // the network address to bind to
-	config    *Config             // configuration values for the listener
-	listen    *http.Server        // a http server for serving websocket connections
-	log       *slog.Logger        // server logger
-	establish EstablishFn         // the server's establish connection handler
-	upgrader  *websocket.Upgrader //  upgrade the incoming http/tcp connection to a websocket compliant connection.
-	end       uint32              // ensure the close methods are only called once
+	id        string                 // the internal id of the listener
+	address   string                 // the network address to bind to
+	config    *Config                // configuration values for the listener
+	listen    *http.Server           // a http server for serving websocket connections
+	log       *safelogger.SafeLogger // server logger
+	establish EstablishFn            // the server's establish connection handler
+	upgrader  *websocket.Upgrader    //  upgrade the incoming http/tcp connection to a websocket compliant connection.
+	end       uint32                 // ensure the close methods are only called once
 }
 
 // NewWebsocket initialises and returns a new Websocket listener, listening on an address.
@@ -76,7 +75,7 @@ func (l *Websocket) Protocol() string {
 }
 
 // Init initializes the listener.
-func (l *Websocket) Init(log *slog.Logger) error {
+func (l *Websocket) Init(log *safelogger.SafeLogger) error {
 	l.log = log
 
 	mux := http.NewServeMux()
@@ -102,7 +101,7 @@ func (l *Websocket) handler(w http.ResponseWriter, r *http.Request) {
 
 	err = l.establish(l.id, &wsConn{Conn: c.UnderlyingConn(), c: c})
 	if err != nil {
-		l.log.Warn("unable to establish connection on listener", "type", "websocket", "error", err, "remote-address", c.RemoteAddr().String())
+		l.log.Warn("unable to establish connection on listener", "listener", l.ID(), "type", "websocket", "error", err, "remote-address", c.RemoteAddr().String())
 	}
 }
 

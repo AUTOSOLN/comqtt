@@ -17,10 +17,11 @@ import (
 	"github.com/wind-c/comqtt/v2/mqtt/hooks/storage"
 	"github.com/wind-c/comqtt/v2/mqtt/packets"
 	"github.com/wind-c/comqtt/v2/mqtt/system"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
 var (
-	logger = slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 
 	client = &mqtt.Client{
 		ID: "test",

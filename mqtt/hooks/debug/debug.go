@@ -6,12 +6,12 @@ package debug
 
 import (
 	"fmt"
-	"log/slog"
 	"strings"
 
 	"github.com/wind-c/comqtt/v2/mqtt"
 	"github.com/wind-c/comqtt/v2/mqtt/hooks/storage"
 	"github.com/wind-c/comqtt/v2/mqtt/packets"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
 // Options contains configuration settings for the debug output.
@@ -25,7 +25,7 @@ type Options struct {
 type Hook struct {
 	mqtt.HookBase
 	config *Options
-	Log    *slog.Logger
+	Log    *safelogger.SafeLogger
 }
 
 // ID returns the ID of the hook.
@@ -54,7 +54,7 @@ func (h *Hook) Init(config any) error {
 }
 
 // SetOpts is called when the hook receives inheritable server parameters.
-func (h *Hook) SetOpts(l *slog.Logger, opts *mqtt.HookOptions) {
+func (h *Hook) SetOpts(l *safelogger.SafeLogger, opts *mqtt.HookOptions) {
 	h.Log = l
 	h.Log.Debug("", "method", "SetOpts")
 }

@@ -9,16 +9,16 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"log/slog"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
 // Net is a listener for establishing client connections on basic TCP protocol.
 type Net struct { // [MQTT-4.2.0-1]
 	mu       sync.Mutex
-	listener net.Listener // a net.Listener which will listen for new clients
-	id       string       // the internal id of the listener
-	log      *slog.Logger // server logger
-	end      uint32       // ensure the close methods are only called once
+	listener net.Listener           // a net.Listener which will listen for new clients
+	id       string                 // the internal id of the listener
+	log      *safelogger.SafeLogger // server logger
+	end      uint32                 // ensure the close methods are only called once
 }
 
 // NewNet initialises and returns a listener serving incoming connections on the given net.Listener
@@ -45,7 +45,7 @@ func (l *Net) Protocol() string {
 }
 
 // Init initializes the listener.
-func (l *Net) Init(log *slog.Logger) error {
+func (l *Net) Init(log *safelogger.SafeLogger) error {
 	l.log = log
 	return nil
 }
@@ -67,7 +67,7 @@ func (l *Net) Serve(establish EstablishFn) {
 			go func() {
 				err = establish(l.id, conn)
 				if err != nil {
-					l.log.Warn("unable to establish connection on listener", "type", "net", "error", err, "remote-address", conn.RemoteAddr().String())
+					l.log.Warn("unable to establish connection on listener", "listener", l.ID(), "type", "net", "error", err, "remote-address", conn.RemoteAddr().String())
 				}
 			}()
 		}

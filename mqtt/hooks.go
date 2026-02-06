@@ -7,13 +7,13 @@ package mqtt
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"sync"
 	"sync/atomic"
 
 	"github.com/wind-c/comqtt/v2/mqtt/hooks/storage"
 	"github.com/wind-c/comqtt/v2/mqtt/packets"
 	"github.com/wind-c/comqtt/v2/mqtt/system"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
 const (
@@ -74,7 +74,7 @@ type Hook interface {
 	Provides(b byte) bool
 	Init(config any) error
 	Stop() error
-	SetOpts(l *slog.Logger, o *HookOptions)
+	SetOpts(l *safelogger.SafeLogger, o *HookOptions)
 	OnStarted()
 	OnStopped()
 	OnConnectAuthenticate(cl *Client, pk packets.Packet) bool
@@ -126,12 +126,12 @@ type HookOptions struct {
 
 // Hooks is a slice of Hook interfaces to be called in sequence.
 type Hooks struct {
-	Log        *slog.Logger   // a logger for the hook (from the server)
-	internal   atomic.Value   // a slice of []Hook
-	wg         sync.WaitGroup // a waitgroup for syncing hook shutdown
-	qty        int64          // the number of hooks in use
-	sync.Mutex                // a mutex for locking when adding hooks
-	halting    atomic.Bool    // If true, the hooks are halting and no more work should be done.
+	Log        *safelogger.SafeLogger // a logger for the hook (from the server)
+	internal   atomic.Value           // a slice of []Hook
+	wg         sync.WaitGroup         // a waitgroup for syncing hook shutdown
+	qty        int64                  // the number of hooks in use
+	sync.Mutex                        // a mutex for locking when adding hooks
+	halting    atomic.Bool            // If true, the hooks are halting and no more work should be done.
 }
 
 // Len returns the number of hooks added.
@@ -917,7 +917,7 @@ func (h *Hooks) OnACLCheck(cl *Client, topic string, write bool) bool {
 // all hooks.
 type HookBase struct {
 	Hook
-	Log  *slog.Logger
+	Log  *safelogger.SafeLogger
 	Opts *HookOptions
 }
 
@@ -940,7 +940,7 @@ func (h *HookBase) Init(config any) error {
 
 // SetOpts is called by the server to propagate internal values and generally should
 // not be called manually.
-func (h *HookBase) SetOpts(l *slog.Logger, opts *HookOptions) {
+func (h *HookBase) SetOpts(l *safelogger.SafeLogger, opts *HookOptions) {
 	h.Log = l
 	h.Opts = opts
 }

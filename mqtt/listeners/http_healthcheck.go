@@ -6,11 +6,12 @@ package listeners
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
 // HTTPHealthCheck is a listener for providing an HTTP healthcheck endpoint.
@@ -55,7 +56,7 @@ func (l *HTTPHealthCheck) Protocol() string {
 }
 
 // Init initializes the listener.
-func (l *HTTPHealthCheck) Init(_ *slog.Logger) error {
+func (l *HTTPHealthCheck) Init(_ *safelogger.SafeLogger) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthcheck", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

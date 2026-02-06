@@ -20,11 +20,12 @@ import (
 	"github.com/wind-c/comqtt/v2/mqtt/listeners"
 	"github.com/wind-c/comqtt/v2/mqtt/packets"
 	"github.com/wind-c/comqtt/v2/mqtt/system"
+	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 
 	"github.com/stretchr/testify/require"
 )
 
-var logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+var logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 type ProtocolTest []struct {
 	protocolVersion byte
@@ -37,7 +38,7 @@ type AllowHook struct {
 	HookBase
 }
 
-func (h *AllowHook) SetOpts(l *slog.Logger, opts *HookOptions) {
+func (h *AllowHook) SetOpts(l *safelogger.SafeLogger, opts *HookOptions) {
 	h.Log = l
 	h.Opts = opts
 }
@@ -57,7 +58,7 @@ type DenyHook struct {
 	HookBase
 }
 
-func (h *DenyHook) SetOpts(l *slog.Logger, opts *HookOptions) {
+func (h *DenyHook) SetOpts(l *safelogger.SafeLogger, opts *HookOptions) {
 	h.Log = l
 	h.Opts = opts
 }
@@ -78,7 +79,7 @@ type DelayHook struct {
 	DisconnectDelay time.Duration
 }
 
-func (h *DelayHook) SetOpts(l *slog.Logger, opts *HookOptions) {
+func (h *DelayHook) SetOpts(l *safelogger.SafeLogger, opts *HookOptions) {
 	h.Log = l
 	h.Opts = opts
 }

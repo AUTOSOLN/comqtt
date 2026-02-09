@@ -6,18 +6,37 @@ import (
 )
 
 type SafeLogger struct {
-	mu     sync.RWMutex
-	logger *slog.Logger
+	mu        sync.RWMutex
+	logger    *slog.Logger
+	logcloser func()
 }
 
-func NewSafeLogger(logger *slog.Logger) *SafeLogger {
-	return &SafeLogger{logger: logger}
+type LogOpener func(args ...any) (*slog.Logger, func(), error)
+
+func NewSafeLogger(logger *slog.Logger, logcloser func()) *SafeLogger {
+	return &SafeLogger{
+		logger:    logger,
+		logcloser: logcloser,
+	}
 }
 
-func (sl *SafeLogger) Swap(newLogger *slog.Logger) {
-	sl.mu.Unlock()
+func (sl *SafeLogger) Swap(openerCb LogOpener, args ...any) error {
+	sl.mu.Lock()
 	defer sl.mu.Unlock()
-	sl.logger = newLogger
+
+	if sl.logcloser != nil {
+		sl.logcloser()
+	}
+
+	newlyOpenedLog, newLogCloser, err := openerCb(args)
+	if err != nil {
+		return err
+	}
+
+	sl.logger = newlyOpenedLog
+	sl.logcloser = newLogCloser
+
+	return nil
 }
 
 func (sl *SafeLogger) Info(msg string, args ...any) {

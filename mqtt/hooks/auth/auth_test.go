@@ -15,7 +15,7 @@ import (
 	"github.com/wind-c/comqtt/v2/threadsafe/safelogger"
 )
 
-var logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+var logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)), nil)
 
 // func teardown(t *testing.T, path string, h *Hook) {
 // 	h.Stop()

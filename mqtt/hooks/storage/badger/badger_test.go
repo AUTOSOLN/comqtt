@@ -21,7 +21,7 @@ import (
 )
 
 var (
-	logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)), nil)
 
 	client = &mqtt.Client{
 		ID: "test",

@@ -25,7 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-var logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+var logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 
 type ProtocolTest []struct {
 	protocolVersion byte

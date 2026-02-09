@@ -221,7 +221,7 @@ func (o *Options) ensureDefaults() {
 
 	if o.Logger == nil {
 		log := slog.New(slog.NewTextHandler(os.Stdout, nil))
-		o.Logger = safelogger.NewSafeLogger(log)
+		o.Logger = safelogger.NewSafeLogger(log, nil)
 	}
 }
 

@@ -32,7 +32,7 @@ func main() {
 	level := new(slog.LevelVar)
 	server.Log = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: level,
-	})))
+	})), nil)
 	level.Set(slog.LevelDebug)
 
 	err := server.AddHook(new(debug.Hook), &debug.Options{

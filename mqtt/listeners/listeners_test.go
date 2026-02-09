@@ -20,7 +20,7 @@ import (
 const testAddr = ":22222"
 
 var (
-	logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	logger = safelogger.NewSafeLogger(slog.New(slog.NewTextHandler(os.Stdout, nil)), nil)
 
 	testCertificate = []byte(`-----BEGIN CERTIFICATE-----
 MIIB/zCCAWgCCQDm3jV+lSF1AzANBgkqhkiG9w0BAQsFADBEMQswCQYDVQQGEwJB

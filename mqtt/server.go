@@ -488,7 +488,7 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver)                                   // [MQTT-3.1.4-3]
 		if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
 			s.UnsubscribeClient(existing)
-			existing.ClearInflights(math.MaxInt64, 0)
+			existing.ClearAllInflightsInMemoryOnly()
 			atomic.StoreUint32(&existing.State.isTakenOver, 1) // only set isTakenOver after unsubscribe has occurred
 			return false                                       // [MQTT-3.2.2-3]
 		}
@@ -1074,7 +1074,11 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 	default:
 		atomic.AddInt64(&s.Info.MessagesDropped, 1)
 		cl.ops.hooks.OnPublishDropped(cl, pk)
-		cl.State.Inflight.Delete(out.PacketID) // packet was dropped due to irregular circumstances, so rollback inflight.
+
+		// packet was dropped due to irregular circumstances, so rollback inflight.
+		cl.State.Inflight.Delete(out.PacketID)
+		cl.ops.hooks.OnQosDropped(cl, out)
+
 		cl.State.Inflight.IncreaseSendQuota()
 		return out, packets.ErrPendingClientWritesExceeded
 	}

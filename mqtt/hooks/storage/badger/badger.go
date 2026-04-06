@@ -325,7 +325,7 @@ func (h *Hook) OnQosComplete(cl *mqtt.Client, pk packets.Packet) {
 
 	err := h.db.Delete(inflightKey(cl, pk), new(storage.Message))
 	if err != nil {
-		h.Log.Error("failed to delete inflight message data", "error", err, "data", inflightKey(cl, pk))
+		h.Log.Debug("unable to delete inflight message data (benign, already deleted)", "error", err, "data", inflightKey(cl, pk))
 	}
 }
 

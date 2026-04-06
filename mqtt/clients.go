@@ -337,6 +337,14 @@ func (cl *Client) ClearInflights(now, maximumExpiry int64) []uint16 {
 	return deleted
 }
 
+func (cl *Client) ClearAllInflightsInMemoryOnly() {
+	for _, tk := range cl.State.Inflight.GetAll(false) {
+		if ok := cl.State.Inflight.Delete(tk.PacketID); ok {
+			atomic.AddInt64(&cl.ops.info.Inflight, -1)
+		}
+	}
+}
+
 // Read reads incoming packets from the connected client and transforms them into
 // packets to be handled by the packetHandler.
 func (cl *Client) Read(packetHandler ReadFn) error {

@@ -515,7 +515,7 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		// Clean the state of the existing client to prevent sequential take-overs
 		// from increasing memory usage by inflights + subs * client-id.
 		s.UnsubscribeClient(existing)
-		existing.ClearInflights(math.MaxInt64, 0)
+		existing.ClearAllInflightsInMemoryOnly()
 
 		s.Log.Debug("session taken over", "client", cl.ID, "old_remote", existing.Net.Remote, "new_remote", cl.Net.Remote)
 

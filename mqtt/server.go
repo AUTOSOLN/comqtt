@@ -1520,7 +1520,9 @@ func (s *Server) closeListenerClients(listener string) {
 
 // sendLWT issues an LWT message to a topic when a client disconnects.
 func (s *Server) sendLWT(cl *Client) {
-	if atomic.LoadUint32(&cl.Properties.Will.Flag) == 0 {
+	// CompareAndSwap atomically claims the will (1→0). If another goroutine
+	// (e.g. OnStopped) already cleared the flag, we return without double-sending.
+	if !atomic.CompareAndSwapUint32(&cl.Properties.Will.Flag, 1, 0) {
 		return
 	}
 
@@ -1552,8 +1554,7 @@ func (s *Server) sendLWT(cl *Client) {
 		s.retainMessage(cl, pk)
 	}
 
-	s.publishToSubscribers(pk)                      // [MQTT-3.1.2-8]
-	atomic.StoreUint32(&cl.Properties.Will.Flag, 0) // [MQTT-3.1.2-10]
+	s.publishToSubscribers(pk) // [MQTT-3.1.2-8]
 	s.hooks.OnWillSent(cl, pk)
 }
 

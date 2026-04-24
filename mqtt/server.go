@@ -1502,6 +1502,14 @@ func (s *Server) publishSysTopics() {
 // Close attempts to gracefully shut down the server, all listeners, clients, and stores.
 func (s *Server) Close() error {
 	close(s.done)
+
+	// Send pending wills before disconnecting any clients so that local subscribers
+	// are still connected and can receive them. sendLWT uses CAS on Will.Flag so
+	// subsequent calls from per-connection goroutines are no-ops.
+	for _, cl := range s.Clients.GetAll() {
+		s.sendLWT(cl)
+	}
+
 	s.Listeners.CloseAll(s.closeListenerClients)
 	s.hooks.OnStopped()
 	s.hooks.Stop()

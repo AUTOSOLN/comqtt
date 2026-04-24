@@ -1869,7 +1869,7 @@ func TestPublishToClientServerDowngradeQos(t *testing.T) {
 	go func() {
 		pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet
 		pkx.FixedHeader.Qos = 2
-		_, _ = s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 2}, pkx)
+		_, _ = s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 2}, pkx, false)
 		time.Sleep(time.Microsecond * 100)
 		_ = w.Close()
 	}()
@@ -1898,7 +1898,7 @@ func TestPublishToClientSubscriptionDowngradeQos(t *testing.T) {
 	go func() {
 		pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet
 		pkx.FixedHeader.Qos = 2
-		_, _ = s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 1}, pkx)
+		_, _ = s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 1}, pkx, false)
 		time.Sleep(time.Microsecond * 100)
 		_ = w.Close()
 	}()
@@ -1935,7 +1935,7 @@ func TestPublishToClientExceedClientWritesPending(t *testing.T) {
 		atomic.AddInt32(&cl.State.outboundQty, 1)
 	}
 
-	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 2}, packets.Packet{})
+	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 2}, packets.Packet{}, false)
 	require.Error(t, err)
 	require.ErrorIs(t, packets.ErrPendingClientWritesExceeded, err)
 }
@@ -1949,8 +1949,8 @@ func TestPublishToClientServerTopicAlias(t *testing.T) {
 
 	go func() {
 		pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishBasicMqtt5).Packet
-		_, _ = s.publishToClient(cl, packets.Subscription{Filter: pkx.TopicName}, pkx)
-		_, _ = s.publishToClient(cl, packets.Subscription{Filter: pkx.TopicName}, pkx)
+		_, _ = s.publishToClient(cl, packets.Subscription{Filter: pkx.TopicName}, pkx, false)
+		_, _ = s.publishToClient(cl, packets.Subscription{Filter: pkx.TopicName}, pkx, false)
 		time.Sleep(time.Millisecond)
 		_ = w.Close()
 	}()
@@ -1975,7 +1975,7 @@ func TestPublishToClientMqtt3RetainFalseLeverageNoConn(t *testing.T) {
 	cl, _, _ := newTestClient()
 	cl.Net.Conn = nil
 
-	out, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", RetainAsPublished: true}, *packets.TPacketData[packets.Publish].Get(packets.TPublishRetain).Packet)
+	out, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", RetainAsPublished: true}, *packets.TPacketData[packets.Publish].Get(packets.TPublishRetain).Packet, false)
 	require.False(t, out.FixedHeader.Retain)
 	require.Error(t, err)
 	require.ErrorIs(t, err, packets.CodeDisconnect)
@@ -1987,7 +1987,7 @@ func TestPublishToClientMqtt5RetainAsPublishedTrueLeverageNoConn(t *testing.T) {
 	cl.Properties.ProtocolVersion = 5
 	cl.Net.Conn = nil
 
-	out, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", RetainAsPublished: true}, *packets.TPacketData[packets.Publish].Get(packets.TPublishRetain).Packet)
+	out, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", RetainAsPublished: true}, *packets.TPacketData[packets.Publish].Get(packets.TPublishRetain).Packet, false)
 	require.True(t, out.FixedHeader.Retain)
 	require.Error(t, err)
 	require.ErrorIs(t, err, packets.CodeDisconnect)
@@ -2000,7 +2000,7 @@ func TestPublishToClientExhaustedPacketID(t *testing.T) {
 		cl.State.Inflight.Set(packets.Packet{PacketID: uint16(i)})
 	}
 
-	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 1}, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet)
+	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 1}, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet, false)
 	require.Error(t, err)
 	require.ErrorIs(t, err, packets.ErrQuotaExceeded)
 }
@@ -2013,7 +2013,7 @@ func TestPublishToClientACLNotAuthorized(t *testing.T) {
 	require.NoError(t, err)
 	cl, _, _ := newTestClient()
 
-	_, err = s.publishToClient(cl, packets.Subscription{Filter: "a/b/c"}, *packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).Packet)
+	_, err = s.publishToClient(cl, packets.Subscription{Filter: "a/b/c"}, *packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).Packet, false)
 	require.Error(t, err)
 	require.ErrorIs(t, err, packets.ErrNotAuthorized)
 }
@@ -2023,7 +2023,7 @@ func TestPublishToClientNoConn(t *testing.T) {
 	cl, _, _ := newTestClient()
 	cl.Net.Conn = nil
 
-	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c"}, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet)
+	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c"}, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet, false)
 	require.Error(t, err)
 	require.ErrorIs(t, err, packets.CodeDisconnect)
 }

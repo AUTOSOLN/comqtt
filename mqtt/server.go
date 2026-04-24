@@ -938,6 +938,29 @@ func (s *Server) publishToSubscribers(pk packets.Packet) {
 	s.PublishToSubscribers(pk, true)
 }
 
+// publishToSubscribersDirect is like publishToSubscribers but writes to each
+// subscriber synchronously via WritePacket, bypassing the async outbound channel.
+// Used only during shutdown so that LWT messages reach subscribers before their
+// WriteLoop goroutines are stopped by CloseAll.
+func (s *Server) publishToSubscribersDirect(pk packets.Packet) {
+	if pk.Created == 0 {
+		pk.Created = time.Now().Unix()
+	}
+	pk.Expiry = pk.Created + s.Options.Capabilities.MaximumMessageExpiryInterval
+
+	subscribers := s.Topics.Subscribers(pk.TopicName)
+	for id, subs := range subscribers.Subscriptions {
+		if cl, ok := s.Clients.Get(id); ok {
+			if _, err := s.publishToClient(cl, subs, pk, true); err != nil {
+				s.Log.Debug("failed direct-publishing LWT to subscriber", "error", err, "client", cl.ID)
+			}
+		}
+	}
+	for _, inlineSub := range subscribers.InlineSubscriptions {
+		inlineSub.Handler(s.inlineClient, inlineSub.Subscription, pk)
+	}
+}
+
 // PublishToSubscribers publishes a publish packet to all subscribers with matching topic filters.
 // local: true indicates the current process call,false indicates external forwarding
 func (s *Server) PublishToSubscribers(pk packets.Packet, local bool) {
@@ -981,7 +1004,7 @@ func (s *Server) PublishToSubscribers(pk packets.Packet, local bool) {
 
 	for id, subs := range subscribers.Subscriptions {
 		if cl, ok := s.Clients.Get(id); ok {
-			if _, err := s.publishToClient(cl, subs, pk); err != nil {
+			if _, err := s.publishToClient(cl, subs, pk, false); err != nil {
 				if strings.HasPrefix(subs.Filter, "$share") {
 					sharedFilters[subs.Filter] = false
 				}
@@ -1000,7 +1023,11 @@ func (s *Server) PublishToSubscribers(pk packets.Packet, local bool) {
 	}
 }
 
-func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packets.Packet) (packets.Packet, error) {
+// publishToClient prepares and delivers a packet to a subscriber. When direct is
+// true the packet is written synchronously via WritePacket, bypassing the async
+// outbound channel. Use direct=true only during shutdown to guarantee delivery
+// before WriteLoop goroutines are stopped.
+func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packets.Packet, direct bool) (packets.Packet, error) {
 	if sub.NoLocal && pk.Origin == cl.ID {
 		return pk, nil // [MQTT-3.8.3-3]
 	}
@@ -1068,6 +1095,18 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		return out, packets.CodeDisconnect
 	}
 
+	if direct {
+		// Synchronous write: used during shutdown so the packet reaches the TCP
+		// send buffer before the WriteLoop goroutine is stopped by CloseAll.
+		if err := cl.WritePacket(out); err != nil {
+			cl.State.Inflight.Delete(out.PacketID)
+			cl.ops.hooks.OnQosDropped(cl, out)
+			cl.State.Inflight.IncreaseSendQuota()
+			return out, err
+		}
+		return out, nil
+	}
+
 	select {
 	case cl.State.outbound <- &out:
 		atomic.AddInt32(&cl.State.outboundQty, 1)
@@ -1097,7 +1136,7 @@ func (s *Server) publishRetainedToClient(cl *Client, sub packets.Subscription, e
 
 	sub.FwdRetainedFlag = true
 	for _, pkv := range s.Topics.Messages(sub.Filter) { // [MQTT-3.8.4-4]
-		_, err := s.publishToClient(cl, sub, pkv)
+		_, err := s.publishToClient(cl, sub, pkv, false)
 		if err != nil {
 			s.Log.Debug("failed to publish retained message", "error", err, "client", cl.ID, "listener", cl.Net.Listener, "packet", pkv)
 			continue
@@ -1562,7 +1601,14 @@ func (s *Server) sendLWT(cl *Client) {
 		s.retainMessage(cl, pk)
 	}
 
-	s.publishToSubscribers(pk) // [MQTT-3.1.2-8]
+	// During shutdown the outbound channel may not drain before WriteLoop goroutines
+	// are stopped, so write directly to the TCP connection instead.
+	select {
+	case <-s.done:
+		s.publishToSubscribersDirect(pk) // [MQTT-3.1.2-8]
+	default:
+		s.publishToSubscribers(pk) // [MQTT-3.1.2-8]
+	}
 	s.hooks.OnWillSent(cl, pk)
 }
 

@@ -27,15 +27,16 @@ var (
 
 // Client is a storable representation of an MQTT client.
 type Client struct {
-	Will            ClientWill       `json:"will,omitempty"`       // will topic and payload data if applicable
-	Properties      ClientProperties `json:"properties,omitempty"` // the connect properties for the client
-	Username        []byte           `json:"username,omitempty"`   // the username of the client
-	ID              string           `json:"id" storm:"id"`        // the client id / storage key
-	T               string           `json:"t,omitempty"`          // the data type (client)
-	Remote          string           `json:"remote,omitempty"`     // the remote address of the client
-	Listener        string           `json:"listener,omitempty"`   // the listener the client connected on
-	ProtocolVersion byte             `json:"protocolVersion"`      // mqtt protocol version of the client
-	Clean           bool             `json:"clean,omitempty"`      // if the client requested a clean start/session
+	Will            ClientWill       `json:"will,omitempty"`           // will topic and payload data if applicable
+	Properties      ClientProperties `json:"properties,omitempty"`     // the connect properties for the client
+	Username        []byte           `json:"username,omitempty"`       // the username of the client
+	ID              string           `json:"id" storm:"id"`            // the client id / storage key
+	T               string           `json:"t,omitempty"`              // the data type (client)
+	Remote          string           `json:"remote,omitempty"`         // the remote address of the client
+	Listener        string           `json:"listener,omitempty"`       // the listener the client connected on
+	ConnectedNode   string           `json:"connected_node,omitempty"` // cluster node advertise addr this client is homed on
+	ProtocolVersion byte             `json:"protocolVersion"`          // mqtt protocol version of the client
+	Clean           bool             `json:"clean,omitempty"`          // if the client requested a clean start/session
 }
 
 // ClientProperties contains a limited set of the mqtt v5 properties specific to a client connection.

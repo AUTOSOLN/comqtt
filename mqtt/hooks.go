@@ -628,10 +628,9 @@ func (h *Hooks) OnWill(cl *Client, will Will) Will {
 
 // OnWillSent is called when an LWT message has been issued from a disconnecting client.
 func (h *Hooks) OnWillSent(cl *Client, pk packets.Packet) {
-	if h.halting.Load() {
-		return
-	}
-
+	// No halting guard: this fires as a notification that the will was already
+	// sent. Suppressing it during shutdown silently drops the QUIC broadcast to
+	// cluster peers, which is the primary caller of this hook.
 	for _, hook := range h.GetAll() {
 		if hook.Provides(OnWillSent) {
 			hook.OnWillSent(cl, pk)

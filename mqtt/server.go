@@ -938,6 +938,29 @@ func (s *Server) publishToSubscribers(pk packets.Packet) {
 	s.PublishToSubscribers(pk, true)
 }
 
+// publishToSubscribersDirect is like publishToSubscribers but writes to each
+// subscriber synchronously via WritePacket, bypassing the async outbound channel.
+// Used only during shutdown so that LWT messages reach subscribers before their
+// WriteLoop goroutines are stopped by CloseAll.
+func (s *Server) publishToSubscribersDirect(pk packets.Packet) {
+	if pk.Created == 0 {
+		pk.Created = time.Now().Unix()
+	}
+	pk.Expiry = pk.Created + s.Options.Capabilities.MaximumMessageExpiryInterval
+
+	subscribers := s.Topics.Subscribers(pk.TopicName)
+	for id, subs := range subscribers.Subscriptions {
+		if cl, ok := s.Clients.Get(id); ok {
+			if _, err := s.publishToClient(cl, subs, pk, true); err != nil {
+				s.Log.Debug("failed direct-publishing LWT to subscriber", "error", err, "client", cl.ID)
+			}
+		}
+	}
+	for _, inlineSub := range subscribers.InlineSubscriptions {
+		inlineSub.Handler(s.inlineClient, inlineSub.Subscription, pk)
+	}
+}
+
 // PublishToSubscribers publishes a publish packet to all subscribers with matching topic filters.
 // local: true indicates the current process call,false indicates external forwarding
 func (s *Server) PublishToSubscribers(pk packets.Packet, local bool) {
@@ -981,7 +1004,7 @@ func (s *Server) PublishToSubscribers(pk packets.Packet, local bool) {
 
 	for id, subs := range subscribers.Subscriptions {
 		if cl, ok := s.Clients.Get(id); ok {
-			if _, err := s.publishToClient(cl, subs, pk); err != nil {
+			if _, err := s.publishToClient(cl, subs, pk, false); err != nil {
 				if strings.HasPrefix(subs.Filter, "$share") {
 					sharedFilters[subs.Filter] = false
 				}
@@ -1000,7 +1023,11 @@ func (s *Server) PublishToSubscribers(pk packets.Packet, local bool) {
 	}
 }
 
-func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packets.Packet) (packets.Packet, error) {
+// publishToClient prepares and delivers a packet to a subscriber. When direct is
+// true the packet is written synchronously via WritePacket, bypassing the async
+// outbound channel. Use direct=true only during shutdown to guarantee delivery
+// before WriteLoop goroutines are stopped.
+func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packets.Packet, direct bool) (packets.Packet, error) {
 	if sub.NoLocal && pk.Origin == cl.ID {
 		return pk, nil // [MQTT-3.8.3-3]
 	}
@@ -1041,31 +1068,55 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 	}
 
 	if out.FixedHeader.Qos > 0 {
-		i, err := cl.NextPacketID() // [MQTT-4.3.2-1] [MQTT-4.3.3-1]
-		if err != nil {
-			s.hooks.OnPacketIDExhausted(cl, pk)
-			s.Log.Warn("packet ids exhausted", "error", err, "client", cl.ID, "listener", cl.Net.Listener)
-			return out, packets.ErrQuotaExceeded
-		}
+		if direct {
+			// Shutdown direct-write path: skip inflight tracking and the send-quota
+			// check. The quota check silently drops the packet when sendQuota==0
+			// (subscriber's ReceiveMaximum exhausted), which is fatal during shutdown
+			// because there will be no retry. Assign a placeholder PacketID so
+			// PublishEncode can encode the QoS 1/2 header; the subscriber will PUBACK
+			// but the broker is already stopping.
+			if out.PacketID == 0 {
+				out.PacketID = 1
+			}
+		} else {
+			i, err := cl.NextPacketID() // [MQTT-4.3.2-1] [MQTT-4.3.3-1]
+			if err != nil {
+				s.hooks.OnPacketIDExhausted(cl, pk)
+				s.Log.Warn("packet ids exhausted", "error", err, "client", cl.ID, "listener", cl.Net.Listener)
+				return out, packets.ErrQuotaExceeded
+			}
 
-		out.PacketID = uint16(i) // [MQTT-2.2.1-4]
-		sentQuota := atomic.LoadInt32(&cl.State.Inflight.sendQuota)
+			out.PacketID = uint16(i) // [MQTT-2.2.1-4]
+			sentQuota := atomic.LoadInt32(&cl.State.Inflight.sendQuota)
 
-		if ok := cl.State.Inflight.Set(out); ok { // [MQTT-4.3.2-3] [MQTT-4.3.3-3]
-			atomic.AddInt64(&s.Info.Inflight, 1)
-			s.hooks.OnQosPublish(cl, out, out.Created, 0)
-			cl.State.Inflight.DecreaseSendQuota()
-		}
+			if ok := cl.State.Inflight.Set(out); ok { // [MQTT-4.3.2-3] [MQTT-4.3.3-3]
+				atomic.AddInt64(&s.Info.Inflight, 1)
+				s.hooks.OnQosPublish(cl, out, out.Created, 0)
+				cl.State.Inflight.DecreaseSendQuota()
+			}
 
-		if sentQuota == 0 && atomic.LoadInt32(&cl.State.Inflight.maximumSendQuota) > 0 {
-			out.Expiry = -1
-			cl.State.Inflight.Set(out)
-			return out, nil
+			if sentQuota == 0 && atomic.LoadInt32(&cl.State.Inflight.maximumSendQuota) > 0 {
+				out.Expiry = -1
+				cl.State.Inflight.Set(out)
+				return out, nil
+			}
 		}
 	}
 
 	if cl.Net.Conn == nil || cl.Closed() {
 		return out, packets.CodeDisconnect
+	}
+
+	if direct {
+		// Synchronous write: used during shutdown so the packet reaches the TCP
+		// send buffer before the WriteLoop goroutine is stopped by CloseAll.
+		if err := cl.WritePacket(out); err != nil {
+			cl.State.Inflight.Delete(out.PacketID)
+			cl.ops.hooks.OnQosDropped(cl, out)
+			cl.State.Inflight.IncreaseSendQuota()
+			return out, err
+		}
+		return out, nil
 	}
 
 	select {
@@ -1097,7 +1148,7 @@ func (s *Server) publishRetainedToClient(cl *Client, sub packets.Subscription, e
 
 	sub.FwdRetainedFlag = true
 	for _, pkv := range s.Topics.Messages(sub.Filter) { // [MQTT-3.8.4-4]
-		_, err := s.publishToClient(cl, sub, pkv)
+		_, err := s.publishToClient(cl, sub, pkv, false)
 		if err != nil {
 			s.Log.Debug("failed to publish retained message", "error", err, "client", cl.ID, "listener", cl.Net.Listener, "packet", pkv)
 			continue
@@ -1502,6 +1553,14 @@ func (s *Server) publishSysTopics() {
 // Close attempts to gracefully shut down the server, all listeners, clients, and stores.
 func (s *Server) Close() error {
 	close(s.done)
+
+	// Send pending wills before disconnecting any clients so that local subscribers
+	// are still connected and can receive them. sendLWT uses CAS on Will.Flag so
+	// subsequent calls from per-connection goroutines are no-ops.
+	for _, cl := range s.Clients.GetAll() {
+		s.sendLWT(cl)
+	}
+
 	s.Listeners.CloseAll(s.closeListenerClients)
 	s.hooks.OnStopped()
 	s.hooks.Stop()
@@ -1520,7 +1579,9 @@ func (s *Server) closeListenerClients(listener string) {
 
 // sendLWT issues an LWT message to a topic when a client disconnects.
 func (s *Server) sendLWT(cl *Client) {
-	if atomic.LoadUint32(&cl.Properties.Will.Flag) == 0 {
+	// CompareAndSwap atomically claims the will (1→0). If another goroutine
+	// (e.g. OnStopped) already cleared the flag, we return without double-sending.
+	if !atomic.CompareAndSwapUint32(&cl.Properties.Will.Flag, 1, 0) {
 		return
 	}
 
@@ -1552,8 +1613,14 @@ func (s *Server) sendLWT(cl *Client) {
 		s.retainMessage(cl, pk)
 	}
 
-	s.publishToSubscribers(pk)                      // [MQTT-3.1.2-8]
-	atomic.StoreUint32(&cl.Properties.Will.Flag, 0) // [MQTT-3.1.2-10]
+	// During shutdown the outbound channel may not drain before WriteLoop goroutines
+	// are stopped, so write directly to the TCP connection instead.
+	select {
+	case <-s.done:
+		s.publishToSubscribersDirect(pk) // [MQTT-3.1.2-8]
+	default:
+		s.publishToSubscribers(pk) // [MQTT-3.1.2-8]
+	}
 	s.hooks.OnWillSent(cl, pk)
 }
 

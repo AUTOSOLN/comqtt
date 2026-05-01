@@ -933,6 +933,19 @@ func (s *Server) retainMessage(cl *Client, pk packets.Packet) {
 	atomic.StoreInt64(&s.Info.Retained, int64(s.Topics.Retained.Len()))
 }
 
+// StoreRetainedMessage stores a retained message in the local topics index and fires
+// OnRetainMessage hooks (e.g. Badger persistence). Intended for cluster peers that receive
+// a forwarded retained publish and need to replicate the retain state locally.
+func (s *Server) StoreRetainedMessage(pk packets.Packet) {
+	if pk.Created == 0 {
+		// Created is stamped to now when zero because it is a broker-internal field not
+		// carried over the MQTT wire format; without it clearExpiredRetainedMessages would
+		// treat the message as immediately expired (0 + MaximumMessageExpiryInterval < now).
+		pk.Created = time.Now().Unix()
+	}
+	s.retainMessage(s.inlineClient, pk)
+}
+
 // PublishToSubscribers publishes a publish packet to all subscribers with matching topic filters.
 func (s *Server) publishToSubscribers(pk packets.Packet) {
 	s.PublishToSubscribers(pk, true)

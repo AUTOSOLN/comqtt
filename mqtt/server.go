@@ -1535,6 +1535,8 @@ func (s *Server) safeAssignNewStats(newStats *map[string]int64) map[string]int64
 // some of the others so the publishing interval should be set appropriately.
 func (s *Server) publishSysTopics() {
 	nowTopicToStats := s.sampleStatistics()
+	atomic.StoreInt64(&s.Info.ClientsDisconnected, nowTopicToStats["/broker/clients/disconnected"])
+	atomic.StoreInt64(&s.Info.ClientsTotal, nowTopicToStats["/broker/clients/total"])
 	prevTopicToStats := s.safeAssignNewStats(&nowTopicToStats)
 
 	toRbeTopicToStats := make(map[string]int64)

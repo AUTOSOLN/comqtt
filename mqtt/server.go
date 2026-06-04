@@ -1493,6 +1493,12 @@ func (s *Server) sampleStatistics() map[string]int64 {
 	currentTime := time.Now().Unix()
 	clientsConnected := atomic.LoadInt64(&s.Info.ClientsConnected)
 	clientsTotal := int64(s.Clients.Len())
+
+	//Exclude inline client from client count in metrics.
+	if s.inlineClient != nil {
+		clientsTotal--
+	}
+
 	clientsDisconnected := clientsTotal - clientsConnected
 
 	stats := map[string]int64{
@@ -1712,6 +1718,11 @@ func (s *Server) loadServerInfo(v system.Info) {
 // loadSubscriptions restores subscriptions from the datastore.
 func (s *Server) loadSubscriptions(v []storage.Subscription) {
 	for _, sub := range v {
+		//Omit loading inline clients saved in the datastore, given that the broker will load them again anyway, if enabled.
+		if sub.Client == InlineClientId {
+			continue
+		}
+
 		sb := packets.Subscription{
 			Filter:            sub.Filter,
 			RetainHandling:    sub.RetainHandling,

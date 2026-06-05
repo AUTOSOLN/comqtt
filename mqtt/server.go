@@ -1799,7 +1799,8 @@ func (s *Server) clearExpiredClients(dt int64) {
 
 		if disconnected+int64(expire) < dt {
 			s.hooks.OnClientExpired(client)
-			s.Clients.Delete(id) // [MQTT-4.1.0-2]
+			s.UnsubscribeClient(client) // [MQTT-4.1.0-2] clean up topic subscriptions on session expiry
+			s.Clients.Delete(id)        // [MQTT-4.1.0-2]
 		}
 	}
 }

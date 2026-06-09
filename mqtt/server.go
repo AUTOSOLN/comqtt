@@ -188,7 +188,14 @@ func New(opts *Options) *Server {
 	}
 
 	stats := s.sampleStatistics()
-	s.safeAssignNewStats(&stats)
+	// Seed TopicToStats with -1 so the first publishSysTopics tick sees every
+	// topic as changed and publishes it — including zero-valued counters that
+	// would otherwise be suppressed by the RBE (0 != 0 is false) check forever.
+	sentinel := make(map[string]int64, len(stats))
+	for k := range stats {
+		sentinel[k] = -1
+	}
+	s.safeAssignNewStats(&sentinel)
 
 	if s.Options.InlineClient {
 		s.inlineClient = s.NewClient(nil, LocalListener, InlineClientId, true)
@@ -1771,7 +1778,9 @@ func (s *Server) loadClients(v []storage.Client) {
 func (s *Server) loadInflight(v []storage.Message) {
 	for _, msg := range v {
 		if client, ok := s.Clients.Get(msg.Origin); ok {
-			client.State.Inflight.Set(msg.ToPacket())
+			if ok := client.State.Inflight.Set(msg.ToPacket()); ok {
+				atomic.AddInt64(&s.Info.Inflight, 1)
+			}
 		}
 	}
 }

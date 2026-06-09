@@ -1564,7 +1564,7 @@ func (s *Server) publishSysTopics() {
 		pk := packets.Packet{
 			FixedHeader: packets.FixedHeader{
 				Type:   packets.Publish,
-				Retain: false,
+				Retain: true,
 				Qos:    1,
 			},
 			Created:   time.Now().Unix(),

@@ -1572,6 +1572,7 @@ func (s *Server) publishSysTopics() {
 			TopicName: SysPrefix + topicToRbe,
 		}
 
+		s.retainMessage(s.inlineClient, pk)
 		s.publishToSubscribers(pk)
 	}
 

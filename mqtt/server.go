@@ -402,6 +402,15 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		}
 	}
 
+	// For local session takeover (InheritWayLocal), retained messages were stripped
+	// from inheritClientSession so they arrive after CONNACK. Deliver them now.
+	// [MQTT-3.1.4-5] requires CONNACK before any other packet.
+	if cl.InheritWay == InheritWayLocal {
+		for _, sub := range cl.State.Subscriptions.GetAll() {
+			s.publishRetainedToClient(cl, sub, true) // true = subscription existed in prior session
+		}
+	}
+
 	s.hooks.OnSessionEstablished(cl, pk)
 
 	err = cl.Read(s.receivePacket)
@@ -516,7 +525,8 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 				s.hooks.OnSubscribed(existing, packets.Packet{Filters: []packets.Subscription{sub}}, []byte{sub.Qos}, []int{count})
 			}
 			cl.State.Subscriptions.Add(sub.Filter, sub)
-			s.publishRetainedToClient(cl, sub, !isNew)
+			// Retained messages are delivered after CONNACK (see connection handler).
+			// Sending them here would violate [MQTT-3.1.4-5] (CONNACK must precede all other packets).
 		}
 
 		// Clean the state of the existing client to prevent sequential take-overs

@@ -188,7 +188,14 @@ func New(opts *Options) *Server {
 	}
 
 	stats := s.sampleStatistics()
-	s.safeAssignNewStats(&stats)
+	// Seed TopicToStats with -1 so the first publishSysTopics tick sees every
+	// topic as changed and publishes it — including zero-valued counters that
+	// would otherwise be suppressed by the RBE (0 != 0 is false) check forever.
+	sentinel := make(map[string]int64, len(stats))
+	for k := range stats {
+		sentinel[k] = -1
+	}
+	s.safeAssignNewStats(&sentinel)
 
 	if s.Options.InlineClient {
 		s.inlineClient = s.NewClient(nil, LocalListener, InlineClientId, true)
@@ -395,6 +402,15 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		}
 	}
 
+	// For local session takeover (InheritWayLocal), retained messages were stripped
+	// from inheritClientSession so they arrive after CONNACK. Deliver them now.
+	// [MQTT-3.1.4-5] requires CONNACK before any other packet.
+	if cl.InheritWay == InheritWayLocal {
+		for _, sub := range cl.State.Subscriptions.GetAll() {
+			s.publishRetainedToClient(cl, sub, true) // true = subscription existed in prior session
+		}
+	}
+
 	s.hooks.OnSessionEstablished(cl, pk)
 
 	err = cl.Read(s.receivePacket)
@@ -509,7 +525,8 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 				s.hooks.OnSubscribed(existing, packets.Packet{Filters: []packets.Subscription{sub}}, []byte{sub.Qos}, []int{count})
 			}
 			cl.State.Subscriptions.Add(sub.Filter, sub)
-			s.publishRetainedToClient(cl, sub, !isNew)
+			// Retained messages are delivered after CONNACK (see connection handler).
+			// Sending them here would violate [MQTT-3.1.4-5] (CONNACK must precede all other packets).
 		}
 
 		// Clean the state of the existing client to prevent sequential take-overs
@@ -1493,6 +1510,12 @@ func (s *Server) sampleStatistics() map[string]int64 {
 	currentTime := time.Now().Unix()
 	clientsConnected := atomic.LoadInt64(&s.Info.ClientsConnected)
 	clientsTotal := int64(s.Clients.Len())
+
+	//Exclude inline client from client count in metrics.
+	if s.inlineClient != nil {
+		clientsTotal--
+	}
+
 	clientsDisconnected := clientsTotal - clientsConnected
 
 	stats := map[string]int64{
@@ -1535,6 +1558,8 @@ func (s *Server) safeAssignNewStats(newStats *map[string]int64) map[string]int64
 // some of the others so the publishing interval should be set appropriately.
 func (s *Server) publishSysTopics() {
 	nowTopicToStats := s.sampleStatistics()
+	atomic.StoreInt64(&s.Info.ClientsDisconnected, nowTopicToStats["/broker/clients/disconnected"])
+	atomic.StoreInt64(&s.Info.ClientsTotal, nowTopicToStats["/broker/clients/total"])
 	prevTopicToStats := s.safeAssignNewStats(&nowTopicToStats)
 
 	toRbeTopicToStats := make(map[string]int64)
@@ -1549,7 +1574,7 @@ func (s *Server) publishSysTopics() {
 		pk := packets.Packet{
 			FixedHeader: packets.FixedHeader{
 				Type:   packets.Publish,
-				Retain: false,
+				Retain: true,
 				Qos:    1,
 			},
 			Created:   time.Now().Unix(),
@@ -1557,6 +1582,7 @@ func (s *Server) publishSysTopics() {
 			TopicName: SysPrefix + topicToRbe,
 		}
 
+		s.retainMessage(s.inlineClient, pk)
 		s.publishToSubscribers(pk)
 	}
 
@@ -1710,6 +1736,11 @@ func (s *Server) loadServerInfo(v system.Info) {
 // loadSubscriptions restores subscriptions from the datastore.
 func (s *Server) loadSubscriptions(v []storage.Subscription) {
 	for _, sub := range v {
+		//Omit loading inline clients saved in the datastore, given that the broker will load them again anyway, if enabled.
+		if sub.Client == InlineClientId {
+			continue
+		}
+
 		sb := packets.Subscription{
 			Filter:            sub.Filter,
 			RetainHandling:    sub.RetainHandling,
@@ -1758,7 +1789,9 @@ func (s *Server) loadClients(v []storage.Client) {
 func (s *Server) loadInflight(v []storage.Message) {
 	for _, msg := range v {
 		if client, ok := s.Clients.Get(msg.Origin); ok {
-			client.State.Inflight.Set(msg.ToPacket())
+			if ok := client.State.Inflight.Set(msg.ToPacket()); ok {
+				atomic.AddInt64(&s.Info.Inflight, 1)
+			}
 		}
 	}
 }
@@ -1786,7 +1819,8 @@ func (s *Server) clearExpiredClients(dt int64) {
 
 		if disconnected+int64(expire) < dt {
 			s.hooks.OnClientExpired(client)
-			s.Clients.Delete(id) // [MQTT-4.1.0-2]
+			s.UnsubscribeClient(client) // [MQTT-4.1.0-2] clean up topic subscriptions on session expiry
+			s.Clients.Delete(id)        // [MQTT-4.1.0-2]
 		}
 	}
 }

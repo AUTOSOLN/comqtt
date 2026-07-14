@@ -34,6 +34,19 @@ const (
 	defaultSysTopicInterval int64 = 1               // the interval between $SYS topic publishes
 	LocalListener                 = "local"
 	InlineClientId                = "inline"
+
+	// ExtAuthDenyCode is the Client.Ext key a hook providing
+	// OnConnectAuthenticate may set to a packets.Code to choose the CONNACK
+	// reason reported for that client's rejection, instead of the default
+	// ErrBadUsernameOrPassword. This lets an auth hook distinguish "this
+	// connection is temporarily unable to be verified" (e.g.
+	// packets.ErrServerBusy, for a saturated verification queue) from wrong
+	// credentials, without changing the bool-only Hook interface that every
+	// OnConnectAuthenticate implementation returns. attachClient checks this
+	// only after OnConnectAuthenticate has already returned false for cl, so
+	// there's no concurrency concern in setting it — cl is never shared
+	// across connections.
+	ExtAuthDenyCode = "mqtt.auth-deny-code"
 )
 
 var (
@@ -372,12 +385,15 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 
 	cl.refreshDeadline(cl.State.Keepalive)
 	if !s.hooks.OnConnectAuthenticate(cl, pk) { // [MQTT-3.1.4-2]
-		err := s.SendConnack(cl, packets.ErrBadUsernameOrPassword, false, nil)
-		if err != nil {
+		code := packets.ErrBadUsernameOrPassword
+		if denyCode, ok := cl.Ext[ExtAuthDenyCode].(packets.Code); ok {
+			code = denyCode
+		}
+		if err := s.SendConnack(cl, code, false, nil); err != nil {
 			return fmt.Errorf("invalid connection send ack: %w", err)
 		}
 
-		return packets.ErrBadUsernameOrPassword
+		return code
 	}
 
 	atomic.AddInt64(&s.Info.ClientsConnected, 1)

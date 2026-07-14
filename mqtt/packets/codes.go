@@ -145,5 +145,8 @@ var (
 		ErrMalformedUsername:          ErrMalformedUsernameOrPassword,
 		ErrMalformedPassword:          ErrMalformedUsernameOrPassword,
 		ErrBadUsernameOrPassword:      Err3NotAuthorized,
+		// MQTTv3 has no distinct "busy" return code, so a v5 ErrServerBusy
+		// CONNACK downgrades to "server unavailable" for v3 clients.
+		ErrServerBusy: Err3ServerUnavailable,
 	}
 )

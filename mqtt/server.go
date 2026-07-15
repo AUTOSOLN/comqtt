@@ -1192,6 +1192,13 @@ func (s *Server) publishRetainedToClient(cl *Client, sub packets.Subscription, e
 		return
 	}
 
+	// The sub here comes from the raw SUBSCRIBE packet (not a stored/merged
+	// subscription), so sub.Identifiers is nil even when sub.Identifier is set.
+	// Populate it so publishToClient includes the identifier per [MQTT-3.3.4-4].
+	if sub.Identifier > 0 && sub.Identifiers == nil {
+		sub.Identifiers = map[string]int{sub.Filter: sub.Identifier}
+	}
+
 	sub.FwdRetainedFlag = true
 	for _, pkv := range s.Topics.Messages(sub.Filter) { // [MQTT-3.8.4-4]
 		_, err := s.publishToClient(cl, sub, pkv, false)

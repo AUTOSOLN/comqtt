@@ -1158,6 +1158,7 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		// send buffer before the WriteLoop goroutine is stopped by CloseAll.
 		if err := cl.WritePacket(out); err != nil {
 			cl.State.Inflight.Delete(out.PacketID)
+			atomic.AddInt64(&s.Info.InflightDropped, 1)
 			cl.ops.hooks.OnQosDropped(cl, out)
 			cl.State.Inflight.IncreaseSendQuota()
 			return out, err
@@ -1174,6 +1175,7 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 
 		// packet was dropped due to irregular circumstances, so rollback inflight.
 		cl.State.Inflight.Delete(out.PacketID)
+		atomic.AddInt64(&s.Info.InflightDropped, 1)
 		cl.ops.hooks.OnQosDropped(cl, out)
 
 		cl.State.Inflight.IncreaseSendQuota()
@@ -1258,6 +1260,7 @@ func (s *Server) processPubrec(cl *Client, pk packets.Packet) error {
 	if pk.ReasonCode >= packets.ErrUnspecifiedError.Code || !pk.ReasonCodeValid() { // [MQTT-4.3.3-4]
 		if ok := cl.State.Inflight.Delete(pk.PacketID); ok {
 			atomic.AddInt64(&s.Info.Inflight, -1)
+			atomic.AddInt64(&s.Info.InflightDropped, 1)
 		}
 		cl.ops.hooks.OnQosDropped(cl, pk)
 		return nil // as per MQTT5 Section 4.13.2 paragraph 2
@@ -1278,6 +1281,7 @@ func (s *Server) processPubrel(cl *Client, pk packets.Packet) error {
 	if pk.ReasonCode >= packets.ErrUnspecifiedError.Code || !pk.ReasonCodeValid() { // [MQTT-4.3.3-9]
 		if ok := cl.State.Inflight.Delete(pk.PacketID); ok {
 			atomic.AddInt64(&s.Info.Inflight, -1)
+			atomic.AddInt64(&s.Info.InflightDropped, 1)
 		}
 		cl.ops.hooks.OnQosDropped(cl, pk)
 		return nil
@@ -1861,11 +1865,9 @@ func (s *Server) clearExpiredRetainedMessages(now int64) {
 // clearExpiredInflights deletes any inflight messages which have expired.
 func (s *Server) clearExpiredInflights(now int64) {
 	for _, client := range s.Clients.GetAll() {
-		if deleted := client.ClearInflights(now, s.Options.Capabilities.MaximumMessageExpiryInterval); len(deleted) > 0 {
-			for _, id := range deleted {
-				s.hooks.OnQosDropped(client, packets.Packet{PacketID: id})
-			}
-		}
+		// ClearInflights already fires OnQosDropped (and updates Info) for each
+		// packet it deletes, so there's no need to fire the hook again here.
+		client.ClearInflights(now, s.Options.Capabilities.MaximumMessageExpiryInterval)
 	}
 }
 

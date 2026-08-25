@@ -321,6 +321,7 @@ func (s *Server) Serve() error {
 	go s.eventLoop()                            // spin up event loop for issuing $SYS values and closing server.
 	s.Listeners.ServeAll(s.EstablishConnection) // start listening on all listeners.
 	s.publishSysTopics()                        // begin publishing $SYS system values.
+	s.publishVersionTopic()                     // publish the server version as a retained $SYS topic.
 	s.hooks.OnStarted()
 
 	return nil
@@ -1574,6 +1575,28 @@ func (s *Server) safeAssignNewStats(newStats *map[string]int64) map[string]int64
 	oldStats := maps.Clone(s.TopicToStats)
 	maps.Copy(s.TopicToStats, *newStats)
 	return oldStats
+}
+
+// publishVersionTopic publishes the server's Version string to a retained $SYS
+// topic. This is published once (rather than on the sysTopics ticker like
+// publishSysTopics) because the value never changes for the life of the
+// process; being retained, it is still delivered to clients that subscribe later.
+// The topic is deliberately not named "version" to avoid colliding with the
+// topic name already used for that purpose by another project depending on this one.
+func (s *Server) publishVersionTopic() {
+	pk := packets.Packet{
+		FixedHeader: packets.FixedHeader{
+			Type:   packets.Publish,
+			Retain: true,
+			Qos:    1,
+		},
+		Created:   time.Now().Unix(),
+		Payload:   []byte(s.Info.Version),
+		TopicName: SysPrefix + "/broker/comqtt_version",
+	}
+
+	s.retainMessage(s.inlineClient, pk)
+	s.publishToSubscribers(pk)
 }
 
 // publishSysTopics publishes the current values to the server $SYS topics.

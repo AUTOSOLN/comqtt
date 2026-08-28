@@ -1938,6 +1938,8 @@ func TestPublishToClientExceedClientWritesPending(t *testing.T) {
 	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 2}, packets.Packet{}, false)
 	require.Error(t, err)
 	require.ErrorIs(t, packets.ErrPendingClientWritesExceeded, err)
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.MessagesDropped))
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
 }
 
 func TestPublishToClientServerTopicAlias(t *testing.T) {
@@ -2317,6 +2319,7 @@ func TestServerProcessPacketPubrecInvalidReason(t *testing.T) {
 	err := s.processPacket(cl, *packets.TPacketData[packets.Pubrec].Get(packets.TPubrecInvalidReason).Packet)
 	require.NoError(t, err)
 	require.Equal(t, int64(-1), atomic.LoadInt64(&s.Info.Inflight))
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
 	_, ok := cl.State.Inflight.Get(pID)
 	require.False(t, ok)
 }
@@ -2407,6 +2410,7 @@ func TestServerProcessPacketPubrelBadReason(t *testing.T) {
 	err := s.processPacket(cl, *packets.TPacketData[packets.Pubrel].Get(packets.TPubrelInvalidReason).Packet)
 	require.NoError(t, err)
 	require.Equal(t, int64(-1), atomic.LoadInt64(&s.Info.Inflight))
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
 	_, ok := cl.State.Inflight.Get(pID)
 	require.False(t, ok)
 }
@@ -3275,6 +3279,7 @@ func TestServerClearExpiredInflights(t *testing.T) {
 	s.clearExpiredInflights(n)
 	require.Len(t, cl.State.Inflight.GetAll(false), 2)
 	require.Equal(t, int64(-3), s.Info.Inflight)
+	require.Equal(t, int64(3), s.Info.InflightDropped)
 }
 
 func TestServerClearExpiredRetained(t *testing.T) {

@@ -290,6 +290,7 @@ func TestClientClearInflights(t *testing.T) {
 	require.Len(t, deleted, 3)
 	require.ElementsMatch(t, []uint16{1, 2, 5}, deleted)
 	require.Equal(t, 2, cl.State.Inflight.Len())
+	require.Equal(t, int64(3), atomic.LoadInt64(&cl.ops.info.InflightDropped))
 }
 
 func TestClientResendInflightMessages(t *testing.T) {

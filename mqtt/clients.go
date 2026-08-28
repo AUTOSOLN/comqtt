@@ -329,6 +329,7 @@ func (cl *Client) ClearInflights(now, maximumExpiry int64) []uint16 {
 			if ok := cl.State.Inflight.Delete(tk.PacketID); ok {
 				cl.ops.hooks.OnQosDropped(cl, tk)
 				atomic.AddInt64(&cl.ops.info.Inflight, -1)
+				atomic.AddInt64(&cl.ops.info.InflightDropped, 1)
 				deleted = append(deleted, tk.PacketID)
 			}
 		}

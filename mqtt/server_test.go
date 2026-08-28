@@ -1938,6 +1938,19 @@ func TestPublishToClientExceedClientWritesPending(t *testing.T) {
 	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 2}, packets.Packet{}, false)
 	require.Error(t, err)
 	require.ErrorIs(t, packets.ErrPendingClientWritesExceeded, err)
+	require.Equal(t, int64(1), s.Info.InflightDropped)
+}
+
+func TestPublishToClientDirectWriteFailure(t *testing.T) {
+	s := newServer()
+	cl, r, _ := newTestClient()
+	_ = r.Close() // break the pipe so cl.WritePacket fails without marking cl closed
+	s.Clients.Add(cl)
+
+	pk := packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: 1}, TopicName: "a/b/c"}
+	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 1}, pk, true)
+	require.Error(t, err)
+	require.Equal(t, int64(1), s.Info.InflightDropped)
 }
 
 func TestPublishToClientServerTopicAlias(t *testing.T) {
@@ -2317,6 +2330,7 @@ func TestServerProcessPacketPubrecInvalidReason(t *testing.T) {
 	err := s.processPacket(cl, *packets.TPacketData[packets.Pubrec].Get(packets.TPubrecInvalidReason).Packet)
 	require.NoError(t, err)
 	require.Equal(t, int64(-1), atomic.LoadInt64(&s.Info.Inflight))
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
 	_, ok := cl.State.Inflight.Get(pID)
 	require.False(t, ok)
 }
@@ -2407,6 +2421,7 @@ func TestServerProcessPacketPubrelBadReason(t *testing.T) {
 	err := s.processPacket(cl, *packets.TPacketData[packets.Pubrel].Get(packets.TPubrelInvalidReason).Packet)
 	require.NoError(t, err)
 	require.Equal(t, int64(-1), atomic.LoadInt64(&s.Info.Inflight))
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
 	_, ok := cl.State.Inflight.Get(pID)
 	require.False(t, ok)
 }
@@ -3275,6 +3290,10 @@ func TestServerClearExpiredInflights(t *testing.T) {
 	s.clearExpiredInflights(n)
 	require.Len(t, cl.State.Inflight.GetAll(false), 2)
 	require.Equal(t, int64(-3), s.Info.Inflight)
+	// Exactly 3, not 6 — clearExpiredInflights must not re-fire OnQosDropped
+	// for ids ClearInflights already fired it for internally, or anything
+	// counting drops via that hook (like InflightDropped) double-counts.
+	require.Equal(t, int64(3), s.Info.InflightDropped)
 }
 
 func TestServerClearExpiredRetained(t *testing.T) {

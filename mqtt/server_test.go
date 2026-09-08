@@ -2627,6 +2627,31 @@ func TestServerProcessPacketSubscribePacketIDInUse(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Suback].Get(packets.TSubackPacketIDInUse).RawBytes, buf)
 }
 
+// Regression test: on a busy reconnect, a resent/queued QoS message's packet ID
+// can collide with a client-assigned SUBSCRIBE packet ID (both commonly start
+// counting from 1). That collision must never hand an MQTT 3.1.1 client the raw
+// MQTT5-only ErrPacketIdentifierInUse (0x91) reason code — such a client has no
+// way to interpret it and disconnects (observed field symptom: mosquitto_sub
+// logging "All subscription requests were denied" right after reconnecting).
+// MQTT3 clients must only ever see reason codes <= CodeGrantedQos2, so the
+// collision should be reported as ErrUnspecifiedError (0x80) instead.
+func TestServerProcessPacketSubscribePacketIDInUseMqtt3(t *testing.T) {
+	s := newServer()
+	cl, r, w := newTestClient() // ProtocolVersion defaults to 4 (MQTT 3.1.1)
+	cl.State.Inflight.Set(packets.Packet{PacketID: 15, FixedHeader: packets.FixedHeader{Type: packets.Publish}})
+
+	pkx := *packets.TPacketData[packets.Subscribe].Get(packets.TSubscribe).Packet // PacketID: 15, single filter
+	go func() {
+		err := s.processPacket(cl, pkx)
+		require.NoError(t, err)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, []byte{packets.ErrUnspecifiedError.Code}, buf[4:], "MQTT3 SUBACK reason code must be clamped, not the raw MQTT5 0x91")
+}
+
 func TestServerProcessPacketSubscribeInvalid(t *testing.T) {
 	s := newServer()
 	cl, _, _ := newTestClient()

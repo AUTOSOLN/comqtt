@@ -1318,49 +1318,60 @@ func (s *Server) processPubcomp(cl *Client, pk packets.Packet) error {
 	return nil
 }
 
+// subscribeFilterOutcome determines the reason code for a single SUBSCRIBE
+// filter and, if the filter is accepted, registers the subscription. packetIDCode
+// is the outcome of the SUBSCRIBE packet's own packet-identifier check, which
+// applies to every filter in the packet ([MQTT-3.8.4] does not allow per-filter
+// mixing here).
+func (s *Server) subscribeFilterOutcome(cl *Client, sub packets.Subscription, packetIDCode packets.Code) (code byte, existed bool, count int) {
+	switch {
+	case packetIDCode != packets.CodeSuccess:
+		code = packetIDCode.Code // NB 3.9.3 Non-normative 0x91
+	case !IsValidFilter(sub.Filter, false):
+		code = packets.ErrTopicFilterInvalid.Code
+	case sub.NoLocal && IsSharedFilter(sub.Filter):
+		code = packets.ErrProtocolViolationInvalidSharedNoLocal.Code // [MQTT-3.8.3-4]
+	case !s.hooks.OnACLCheck(cl, sub.Filter, false):
+		code = packets.ErrNotAuthorized.Code
+		if s.Options.Capabilities.Compatibilities.ObscureNotAuthorized {
+			code = packets.ErrUnspecifiedError.Code
+		}
+	default:
+		isNew, n := s.Topics.Subscribe(cl.ID, sub) // [MQTT-3.8.4-3]
+		if isNew {
+			atomic.AddInt64(&s.Info.Subscriptions, 1)
+		}
+		cl.State.Subscriptions.Add(sub.Filter, sub) // [MQTT-3.2.2-10]
+
+		if sub.Qos > s.Options.Capabilities.MaximumQos {
+			sub.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9]
+		}
+
+		existed = !isNew
+		count = n
+		code = sub.Qos // [MQTT-3.9.3-1] [MQTT-3.8.4-7]
+	}
+
+	if code > packets.CodeGrantedQos2.Code && cl.Properties.ProtocolVersion < 5 { // MQTT3
+		code = packets.ErrUnspecifiedError.Code
+	}
+
+	return code, existed, count
+}
+
 // processSubscribe processes a Subscribe packet.
 func (s *Server) processSubscribe(cl *Client, pk packets.Packet) error {
 	pk = s.hooks.OnSubscribe(cl, pk)
-	code := packets.CodeSuccess
+	packetIDCode := packets.CodeSuccess
 	if _, ok := cl.State.Inflight.Get(pk.PacketID); ok {
-		code = packets.ErrPacketIdentifierInUse
+		packetIDCode = packets.ErrPacketIdentifierInUse
 	}
 
 	filterExisted := make([]bool, len(pk.Filters))
 	reasonCodes := make([]byte, len(pk.Filters))
 	counts := make([]int, len(pk.Filters)) // An array of the number of subscribers for the same filter
 	for i, sub := range pk.Filters {
-		if code != packets.CodeSuccess {
-			reasonCodes[i] = code.Code // NB 3.9.3 Non-normative 0x91
-			continue
-		} else if !IsValidFilter(sub.Filter, false) {
-			reasonCodes[i] = packets.ErrTopicFilterInvalid.Code
-		} else if sub.NoLocal && IsSharedFilter(sub.Filter) {
-			reasonCodes[i] = packets.ErrProtocolViolationInvalidSharedNoLocal.Code // [MQTT-3.8.3-4]
-		} else if !s.hooks.OnACLCheck(cl, sub.Filter, false) {
-			reasonCodes[i] = packets.ErrNotAuthorized.Code
-			if s.Options.Capabilities.Compatibilities.ObscureNotAuthorized {
-				reasonCodes[i] = packets.ErrUnspecifiedError.Code
-			}
-		} else {
-			isNew, count := s.Topics.Subscribe(cl.ID, sub) // [MQTT-3.8.4-3]
-			if isNew {
-				atomic.AddInt64(&s.Info.Subscriptions, 1)
-			}
-			cl.State.Subscriptions.Add(sub.Filter, sub) // [MQTT-3.2.2-10]
-
-			if sub.Qos > s.Options.Capabilities.MaximumQos {
-				sub.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9]
-			}
-
-			filterExisted[i] = !isNew
-			reasonCodes[i] = sub.Qos // [MQTT-3.9.3-1] [MQTT-3.8.4-7]
-			counts[i] = count
-		}
-
-		if reasonCodes[i] > packets.CodeGrantedQos2.Code && cl.Properties.ProtocolVersion < 5 { // MQTT3
-			reasonCodes[i] = packets.ErrUnspecifiedError.Code
-		}
+		reasonCodes[i], filterExisted[i], counts[i] = s.subscribeFilterOutcome(cl, sub, packetIDCode)
 	}
 
 	ack := packets.Packet{ // [MQTT-3.8.4-1] [MQTT-3.8.4-5]
@@ -1374,8 +1385,8 @@ func (s *Server) processSubscribe(cl *Client, pk packets.Packet) error {
 		},
 	}
 
-	if code.Code >= packets.ErrUnspecifiedError.Code {
-		ack.Properties.ReasonString = code.Reason
+	if packetIDCode.Code >= packets.ErrUnspecifiedError.Code {
+		ack.Properties.ReasonString = packetIDCode.Reason
 	}
 
 	s.hooks.OnSubscribed(cl, pk, reasonCodes, counts)

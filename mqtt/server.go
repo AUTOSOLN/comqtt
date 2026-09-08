@@ -533,6 +533,9 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 				cl.State.Inflight.ResetSendQuota(int32(cl.Properties.Props.ReceiveMaximum))            // client receive max
 			}
 		}
+		if existing.State.InboundInflight.Len() > 0 {
+			cl.State.InboundInflight = existing.State.InboundInflight.Clone() // [MQTT-3.1.2-5]
+		}
 
 		for _, sub := range existing.State.Subscriptions.GetAll() {
 			isNew, count := s.Topics.Subscribe(cl.ID, sub) // [MQTT-3.8.4-3]
@@ -876,12 +879,12 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	pk.Created = time.Now().Unix()
 
 	if !cl.Net.Inline {
-		if pki, ok := cl.State.Inflight.Get(pk.PacketID); ok {
+		if pki, ok := cl.State.InboundInflight.Get(pk.PacketID); ok {
 			if pki.FixedHeader.Type == packets.Pubrec { // [MQTT-4.3.3-10]
 				ack := s.buildAck(pk.PacketID, packets.Pubrec, 0, pk.Properties, packets.ErrPacketIdentifierInUse)
 				return cl.WritePacket(ack)
 			}
-			if ok := cl.State.Inflight.Delete(pk.PacketID); ok { // [MQTT-4.3.2-5]
+			if ok := cl.State.InboundInflight.Delete(pk.PacketID); ok { // [MQTT-4.3.2-5]
 				atomic.AddInt64(&s.Info.Inflight, -1)
 			}
 		}
@@ -929,7 +932,7 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 		ack = s.buildAck(pk.PacketID, packets.Pubrec, 0, pk.Properties, packets.CodeSuccess) // [MQTT-3.3.4-1] [MQTT-4.3.3-8]
 	}
 
-	if ok := cl.State.Inflight.Set(ack); ok {
+	if ok := cl.State.InboundInflight.Set(ack); ok {
 		atomic.AddInt64(&s.Info.Inflight, 1)
 		s.hooks.OnQosPublish(cl, ack, ack.Created, 0)
 	}
@@ -940,7 +943,7 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	}
 
 	if pk.FixedHeader.Qos == 1 {
-		if ok := cl.State.Inflight.Delete(ack.PacketID); ok {
+		if ok := cl.State.InboundInflight.Delete(ack.PacketID); ok {
 			atomic.AddInt64(&s.Info.Inflight, -1)
 		}
 		cl.State.Inflight.IncreaseReceiveQuota()
@@ -1274,12 +1277,12 @@ func (s *Server) processPubrec(cl *Client, pk packets.Packet) error {
 
 // processPubrel processes a Pubrel packet, denoting completion of a QOS 2 packet sent from the client.
 func (s *Server) processPubrel(cl *Client, pk packets.Packet) error {
-	if _, ok := cl.State.Inflight.Get(pk.PacketID); !ok { // [MQTT-4.3.3-7] [MQTT-4.3.3-13]
+	if _, ok := cl.State.InboundInflight.Get(pk.PacketID); !ok { // [MQTT-4.3.3-7] [MQTT-4.3.3-13]
 		return cl.WritePacket(s.buildAck(pk.PacketID, packets.Pubcomp, 0, pk.Properties, packets.ErrPacketIdentifierNotFound))
 	}
 
 	if pk.ReasonCode >= packets.ErrUnspecifiedError.Code || !pk.ReasonCodeValid() { // [MQTT-4.3.3-9]
-		if ok := cl.State.Inflight.Delete(pk.PacketID); ok {
+		if ok := cl.State.InboundInflight.Delete(pk.PacketID); ok {
 			atomic.AddInt64(&s.Info.Inflight, -1)
 			atomic.AddInt64(&s.Info.InflightDropped, 1)
 		}
@@ -1288,16 +1291,16 @@ func (s *Server) processPubrel(cl *Client, pk packets.Packet) error {
 	}
 
 	ack := s.buildAck(pk.PacketID, packets.Pubcomp, 0, pk.Properties, packets.CodeSuccess) // [MQTT-4.3.3-11]
-	cl.State.Inflight.Set(ack)
+	cl.State.InboundInflight.Set(ack)
 
 	err := cl.WritePacket(ack)
 	if err != nil {
 		return err
 	}
 
-	cl.State.Inflight.IncreaseReceiveQuota()             // +1 RECV QUOTA
-	cl.State.Inflight.IncreaseSendQuota()                // +1 SENT QUOTA
-	if ok := cl.State.Inflight.Delete(pk.PacketID); ok { // [MQTT-4.3.3-12]
+	cl.State.Inflight.IncreaseReceiveQuota()                    // +1 RECV QUOTA
+	cl.State.Inflight.IncreaseSendQuota()                       // +1 SENT QUOTA
+	if ok := cl.State.InboundInflight.Delete(pk.PacketID); ok { // [MQTT-4.3.3-12]
 		atomic.AddInt64(&s.Info.Inflight, -1)
 		s.hooks.OnQosComplete(cl, pk)
 	}
@@ -1363,7 +1366,7 @@ func (s *Server) subscribeFilterOutcome(cl *Client, sub packets.Subscription, pa
 func (s *Server) processSubscribe(cl *Client, pk packets.Packet) error {
 	pk = s.hooks.OnSubscribe(cl, pk)
 	packetIDCode := packets.CodeSuccess
-	if _, ok := cl.State.Inflight.Get(pk.PacketID); ok {
+	if _, ok := cl.State.InboundInflight.Get(pk.PacketID); ok {
 		packetIDCode = packets.ErrPacketIdentifierInUse
 	}
 
@@ -1409,7 +1412,7 @@ func (s *Server) processSubscribe(cl *Client, pk packets.Packet) error {
 // processUnsubscribe processes an unsubscribe packet.
 func (s *Server) processUnsubscribe(cl *Client, pk packets.Packet) error {
 	code := packets.CodeSuccess
-	if _, ok := cl.State.Inflight.Get(pk.PacketID); ok {
+	if _, ok := cl.State.InboundInflight.Get(pk.PacketID); ok {
 		code = packets.ErrPacketIdentifierInUse
 	}
 

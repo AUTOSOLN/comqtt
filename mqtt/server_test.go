@@ -3261,6 +3261,65 @@ func TestServerLoadInflightMessages(t *testing.T) {
 	require.True(t, ok)
 }
 
+// Regression test: loadInflightForClient must restore messages onto the client
+// id it was explicitly asked to restore for, not onto whichever client
+// happens to match msg.Origin. Origin records who originally published a
+// message, which is frequently a different client than the one the message is
+// queued for (e.g. clientA publishes to a topic clientB is subscribed to;
+// clientB's queued copy has Origin "clientA"). loadInflight (the generic,
+// bulk, all-clients restore used at startup) is the one that relies on
+// Origin, and is intentionally left alone; loadInflightForClient is the
+// recipient-aware variant used by loadClientHistory, where the cid is already
+// known from the StoredInflightMessagesByCid(cid) query that produced v.
+func TestServerLoadInflightMessagesForClient(t *testing.T) {
+	s := newServer()
+	s.loadClients([]storage.Client{
+		{ID: "mochi"},
+		{ID: "zen"},
+	})
+
+	require.Equal(t, 2, s.Clients.Len())
+
+	// both messages were originally published by "zen", but are queued
+	// (recipient) for "mochi" -- Origin must not be used to resolve the
+	// recipient here.
+	v := []storage.Message{
+		{Origin: "zen", PacketID: 1, Payload: []byte("hello world"), TopicName: "a/b/c"},
+		{Origin: "zen", PacketID: 2, Payload: []byte("yes"), TopicName: "a/b/c"},
+	}
+	s.loadInflightForClient("mochi", v)
+
+	cl, ok := s.Clients.Get("mochi")
+	require.True(t, ok)
+	require.Equal(t, 2, cl.State.Inflight.Len())
+
+	msg, ok := cl.State.Inflight.Get(2)
+	require.True(t, ok)
+	require.Equal(t, []byte{'y', 'e', 's'}, msg.Payload)
+
+	// "zen" (the Origin, not the recipient) must not have received these.
+	zen, ok := s.Clients.Get("zen")
+	require.True(t, ok)
+	require.Equal(t, 0, zen.State.Inflight.Len())
+}
+
+func TestServerLoadInflightMessagesForClientUnknownCid(t *testing.T) {
+	s := newServer()
+	s.loadClients([]storage.Client{{ID: "mochi"}})
+
+	// restoring for a cid with no matching connected client must be a no-op,
+	// not a panic or a misroute onto some other client.
+	require.NotPanics(t, func() {
+		s.loadInflightForClient("does-not-exist", []storage.Message{
+			{Origin: "mochi", PacketID: 1, Payload: []byte("hello world")},
+		})
+	})
+
+	cl, ok := s.Clients.Get("mochi")
+	require.True(t, ok)
+	require.Equal(t, 0, cl.State.Inflight.Len())
+}
+
 func TestServerLoadRetainedMessages(t *testing.T) {
 	s := newServer()
 

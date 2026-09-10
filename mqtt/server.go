@@ -647,7 +647,7 @@ func (s *Server) loadClientHistory(cid string) bool {
 	if err != nil {
 		return false
 	}
-	s.loadInflight(fs)
+	s.loadInflightForClient(cid, fs)
 
 	if len(ss) > 0 || len(fs) > 0 {
 		return true
@@ -1833,6 +1833,24 @@ func (s *Server) loadInflight(v []storage.Message) {
 			if ok := client.State.Inflight.Set(msg.ToPacket()); ok {
 				atomic.AddInt64(&s.Info.Inflight, 1)
 			}
+		}
+	}
+}
+
+// loadInflightForClient restores inflight messages queued for a single, known
+// client id. Unlike loadInflight (used for the bulk, all-clients restore at
+// startup), the recipient here is the cid the caller already queried by, not
+// msg.Origin — Origin records who originally published the message, which is
+// often a different client than the one the message is queued for.
+func (s *Server) loadInflightForClient(cid string, v []storage.Message) {
+	client, ok := s.Clients.Get(cid)
+	if !ok {
+		return
+	}
+
+	for _, msg := range v {
+		if ok := client.State.Inflight.Set(msg.ToPacket()); ok {
+			atomic.AddInt64(&s.Info.Inflight, 1)
 		}
 	}
 }

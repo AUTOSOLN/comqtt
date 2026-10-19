@@ -1430,6 +1430,18 @@ func (s *Server) processUnsubscribe(cl *Client, pk packets.Packet) error {
 			continue
 		}
 
+		// Unsubscribing requires the same (read) permission as subscribing, so a
+		// client can't remove subscriptions on filters it isn't authorized for.
+		// MQTT3 UNSUBACK carries no reason codes, so a denied filter there is
+		// simply left subscribed.
+		if !s.hooks.OnACLCheck(cl, sub.Filter, false) {
+			reasonCodes[i] = packets.ErrNotAuthorized.Code
+			if s.Options.Capabilities.Compatibilities.ObscureNotAuthorized {
+				reasonCodes[i] = packets.ErrUnspecifiedError.Code
+			}
+			continue
+		}
+
 		q, count := s.Topics.Unsubscribe(sub.Filter, cl.ID)
 		if q {
 			atomic.AddInt64(&s.Info.Subscriptions, -1)

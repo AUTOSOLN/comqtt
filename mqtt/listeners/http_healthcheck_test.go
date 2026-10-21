@@ -6,9 +6,9 @@ package listeners
 
 import (
 	"io"
+	"net"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -39,7 +39,8 @@ func TestHTTPHealthCheckTLSProtocol(t *testing.T) {
 		TLSConfig: tlsConfigBasic,
 	})
 
-	_ = l.Init(logger)
+	require.NoError(t, l.Init(logger))
+	t.Cleanup(func() { l.Close(MockCloser) })
 	require.Equal(t, "https", l.Protocol())
 }
 
@@ -47,6 +48,7 @@ func TestHTTPHealthCheckInit(t *testing.T) {
 	l := NewHTTPHealthCheck("healthcheck", testAddr, nil)
 	err := l.Init(logger)
 	require.NoError(t, err)
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	require.NotNil(t, l.listen)
 	require.Equal(t, testAddr, l.listen.Addr)
@@ -57,14 +59,13 @@ func TestHTTPHealthCheckServeAndClose(t *testing.T) {
 	l := NewHTTPHealthCheck("healthcheck", testAddr, nil)
 	err := l.Init(logger)
 	require.NoError(t, err)
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	o := make(chan bool)
 	go func(o chan bool) {
 		l.Serve(MockEstablisher)
 		o <- true
 	}(o)
-
-	time.Sleep(time.Millisecond)
 
 	// call healthcheck
 	resp, err := http.Get("http://localhost" + testAddr + "/healthcheck")
@@ -93,14 +94,13 @@ func TestHTTPHealthCheckServeAndCloseMethodNotAllowed(t *testing.T) {
 	l := NewHTTPHealthCheck("healthcheck", testAddr, nil)
 	err := l.Init(logger)
 	require.NoError(t, err)
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	o := make(chan bool)
 	go func(o chan bool) {
 		l.Serve(MockEstablisher)
 		o <- true
 	}(o)
-
-	time.Sleep(time.Millisecond)
 
 	// make disallowed method type http request
 	resp, err := http.Post("http://localhost"+testAddr+"/healthcheck", "application/json", http.NoBody)
@@ -131,6 +131,7 @@ func TestHTTPHealthCheckServeTLSAndClose(t *testing.T) {
 
 	err := l.Init(logger)
 	require.NoError(t, err)
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	o := make(chan bool)
 	go func(o chan bool) {
@@ -138,6 +139,25 @@ func TestHTTPHealthCheckServeTLSAndClose(t *testing.T) {
 		o <- true
 	}(o)
 
-	time.Sleep(time.Millisecond)
 	l.Close(MockCloser)
+}
+
+func TestHTTPHealthCheckInitAddressInUse(t *testing.T) {
+	ln, err := net.Listen("tcp", testAddr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	l := NewHTTPHealthCheck("healthcheck", testAddr, nil)
+	require.Error(t, l.Init(logger))
+}
+
+func TestHTTPHealthCheckCloseWithoutServe(t *testing.T) {
+	l := NewHTTPHealthCheck("healthcheck", testAddr, nil)
+	require.NoError(t, l.Init(logger))
+	l.Close(MockCloser)
+
+	// the port is free again even though Serve never ran
+	ln, err := net.Listen("tcp", testAddr)
+	require.NoError(t, err)
+	_ = ln.Close()
 }

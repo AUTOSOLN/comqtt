@@ -7,9 +7,9 @@ package listeners
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/wind-c/comqtt/v2/mqtt/system"
 
@@ -42,7 +42,8 @@ func TestHTTPStatsTLSProtocol(t *testing.T) {
 		TLSConfig: tlsConfigBasic,
 	}, nil)
 
-	_ = l.Init(logger)
+	require.NoError(t, l.Init(logger))
+	t.Cleanup(func() { l.Close(MockCloser) })
 	require.Equal(t, "https", l.Protocol())
 }
 
@@ -51,6 +52,7 @@ func TestHTTPStatsInit(t *testing.T) {
 	l := NewHTTPStats("t1", testAddr, nil, sysInfo)
 	err := l.Init(logger)
 	require.NoError(t, err)
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	require.NotNil(t, l.sysInfo)
 	require.Equal(t, sysInfo, l.sysInfo)
@@ -67,14 +69,13 @@ func TestHTTPStatsServeAndClose(t *testing.T) {
 	l := NewHTTPStats("t1", testAddr, nil, sysInfo)
 	err := l.Init(logger)
 	require.NoError(t, err)
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	o := make(chan bool)
 	go func(o chan bool) {
 		l.Serve(MockEstablisher)
 		o <- true
 	}(o)
-
-	time.Sleep(time.Millisecond)
 
 	// get body from stats address
 	resp, err := http.Get("http://localhost" + testAddr + "/mqtt/stats")
@@ -115,6 +116,7 @@ func TestHTTPStatsServeTLSAndClose(t *testing.T) {
 
 	err := l.Init(logger)
 	require.NoError(t, err)
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	o := make(chan bool)
 	go func(o chan bool) {
@@ -122,6 +124,25 @@ func TestHTTPStatsServeTLSAndClose(t *testing.T) {
 		o <- true
 	}(o)
 
-	time.Sleep(time.Millisecond)
 	l.Close(MockCloser)
+}
+
+func TestHTTPStatsInitAddressInUse(t *testing.T) {
+	ln, err := net.Listen("tcp", testAddr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	l := NewHTTPStats("t1", testAddr, nil, nil)
+	require.Error(t, l.Init(logger))
+}
+
+func TestHTTPStatsCloseWithoutServe(t *testing.T) {
+	l := NewHTTPStats("t1", testAddr, nil, nil)
+	require.NoError(t, l.Init(logger))
+	l.Close(MockCloser)
+
+	// the port is free again even though Serve never ran
+	ln, err := net.Listen("tcp", testAddr)
+	require.NoError(t, err)
+	_ = ln.Close()
 }

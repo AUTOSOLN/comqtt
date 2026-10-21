@@ -39,8 +39,8 @@ func TestTCPProtocolTLS(t *testing.T) {
 		TLSConfig: tlsConfigBasic,
 	})
 
-	_ = l.Init(logger)
-	defer l.listen.Close()
+	require.NoError(t, l.Init(logger))
+	t.Cleanup(func() { l.Close(MockCloser) })
 	require.Equal(t, "tcp", l.Protocol())
 }
 

@@ -77,7 +77,7 @@ func (m *Membership) Setup() (err error) {
 		return
 	}
 
-	go m.eventLoop() // start the event loop, will stop when serfCh is closed
+	go m.eventLoop() // start the event loop, stops when serf shuts down
 
 	if m.config.Members != nil {
 		if len(m.config.Members) > 0 {
@@ -123,9 +123,6 @@ func (m *Membership) Stop() {
 	if err != nil {
 		log.Error("serf shutdown", "error", err)
 	}
-	// this shuts down the event loop, note that this can't be called multiple times
-	// if we need to do so, we could use a bool, sync.Once or recover from the panic
-	close(m.serfCh)
 }
 
 func genEvent(tp int, node *serf.Member) *mb.Event {
@@ -141,55 +138,60 @@ func genEvent(tp int, node *serf.Member) *mb.Event {
 }
 
 func (m *Membership) eventLoop() {
-	for e := range m.serfCh {
-		switch e.EventType() {
-		case serf.EventMemberLeave, serf.EventMemberFailed:
-			for _, member := range e.(serf.MemberEvent).Members {
-				if m.isLocal(member) {
+	for {
+		select {
+		case e := <-m.serfCh:
+			switch e.EventType() {
+			case serf.EventMemberLeave, serf.EventMemberFailed:
+				for _, member := range e.(serf.MemberEvent).Members {
+					if m.isLocal(member) {
+						continue
+					}
+					m.eventCh <- genEvent(mb.EventLeave, &member)
+					onLog(&member, "member leave")
+				}
+			case serf.EventMemberJoin:
+				for _, member := range e.(serf.MemberEvent).Members {
+					if m.isLocal(member) {
+						continue
+					}
+					m.eventCh <- genEvent(mb.EventJoin, &member)
+					onLog(&member, "member join")
+				}
+			case serf.EventMemberUpdate:
+				for _, member := range e.(serf.MemberEvent).Members {
+					if m.isLocal(member) {
+						continue
+					}
+					m.eventCh <- genEvent(mb.EventUpdate, &member)
+					onLog(&member, "member update")
+				}
+			case serf.EventMemberReap:
+				for _, member := range e.(serf.MemberEvent).Members {
+					if m.isLocal(member) {
+						continue
+					}
+					m.eventCh <- genEvent(mb.EventReap, &member)
+					onLog(&member, "member reap")
+				}
+			case serf.EventUser:
+				ue := e.(serf.UserEvent)
+				if ue.Name == m.config.NodeName {
 					continue
 				}
-				m.eventCh <- genEvent(mb.EventLeave, &member)
-				onLog(&member, "member leave")
-			}
-		case serf.EventMemberJoin:
-			for _, member := range e.(serf.MemberEvent).Members {
-				if m.isLocal(member) {
+				m.msgCh <- ue.Payload
+			case serf.EventQuery:
+				q := e.(*serf.Query)
+				if q.SourceNode() == m.config.NodeName {
 					continue
 				}
-				m.eventCh <- genEvent(mb.EventJoin, &member)
-				onLog(&member, "member join")
+				m.msgCh <- q.Payload
+				//m.handleQuery(e.(*serf.Query))
+			default:
+				panic("unknown serf event type")
 			}
-		case serf.EventMemberUpdate:
-			for _, member := range e.(serf.MemberEvent).Members {
-				if m.isLocal(member) {
-					continue
-				}
-				m.eventCh <- genEvent(mb.EventUpdate, &member)
-				onLog(&member, "member update")
-			}
-		case serf.EventMemberReap:
-			for _, member := range e.(serf.MemberEvent).Members {
-				if m.isLocal(member) {
-					continue
-				}
-				m.eventCh <- genEvent(mb.EventReap, &member)
-				onLog(&member, "member reap")
-			}
-		case serf.EventUser:
-			ue := e.(serf.UserEvent)
-			if ue.Name == m.config.NodeName {
-				continue
-			}
-			m.msgCh <- ue.Payload
-		case serf.EventQuery:
-			q := e.(*serf.Query)
-			if q.SourceNode() == m.config.NodeName {
-				continue
-			}
-			m.msgCh <- q.Payload
-			//m.handleQuery(e.(*serf.Query))
-		default:
-			panic("unknown serf event type")
+		case <-m.serf.ShutdownCh():
+			return
 		}
 	}
 }

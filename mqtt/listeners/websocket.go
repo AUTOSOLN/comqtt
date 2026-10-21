@@ -31,6 +31,7 @@ type Websocket struct { // [MQTT-4.2.0-1]
 	address   string              // the network address to bind to
 	config    *Config             // configuration values for the listener
 	listen    *http.Server        // a http server for serving websocket connections
+	ln        net.Listener        // the bound network listener, set in Init
 	log       *slog.Logger        // server logger
 	establish EstablishFn         // the server's establish connection handler
 	upgrader  *websocket.Upgrader //  upgrade the incoming http/tcp connection to a websocket compliant connection.
@@ -89,7 +90,9 @@ func (l *Websocket) Init(log *slog.Logger) error {
 		WriteTimeout: 60 * time.Second,
 	}
 
-	return nil
+	var err error
+	l.ln, err = net.Listen("tcp", l.address)
+	return err
 }
 
 // handler upgrades and handles an incoming websocket connection.
@@ -112,9 +115,9 @@ func (l *Websocket) Serve(establish EstablishFn) {
 	l.establish = establish
 
 	if l.listen.TLSConfig != nil {
-		_ = l.listen.ListenAndServeTLS("", "")
+		_ = l.listen.ServeTLS(l.ln, "", "")
 	} else {
-		_ = l.listen.ListenAndServe()
+		_ = l.listen.Serve(l.ln)
 	}
 }
 
@@ -127,6 +130,9 @@ func (l *Websocket) Close(closeClients CloseFn) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = l.listen.Shutdown(ctx)
+		if l.ln != nil {
+			_ = l.ln.Close() // Shutdown only closes listeners Serve has started using
+		}
 	}
 
 	closeClients(l.id)

@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
@@ -49,20 +48,20 @@ func TestWebsocketInit(t *testing.T) {
 	require.Nil(t, l.listen)
 	err := l.Init(logger)
 	require.NoError(t, err)
+	t.Cleanup(func() { l.Close(MockCloser) })
 	require.NotNil(t, l.listen)
 }
 
 func TestWebsocketServeAndClose(t *testing.T) {
 	l := NewWebsocket("t1", testAddr, nil)
-	_ = l.Init(logger)
+	require.NoError(t, l.Init(logger))
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	o := make(chan bool)
 	go func(o chan bool) {
 		l.Serve(MockEstablisher)
 		o <- true
 	}(o)
-
-	time.Sleep(time.Millisecond)
 
 	var closed bool
 	l.Close(func(id string) {
@@ -79,6 +78,7 @@ func TestWebsocketServeTLSAndClose(t *testing.T) {
 	})
 	err := l.Init(logger)
 	require.NoError(t, err)
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	o := make(chan bool)
 	go func(o chan bool) {
@@ -86,7 +86,6 @@ func TestWebsocketServeTLSAndClose(t *testing.T) {
 		o <- true
 	}(o)
 
-	time.Sleep(time.Millisecond)
 	var closed bool
 	l.Close(func(id string) {
 		closed = true
@@ -96,7 +95,8 @@ func TestWebsocketServeTLSAndClose(t *testing.T) {
 
 func TestWebsocketUpgrade(t *testing.T) {
 	l := NewWebsocket("t1", testAddr, nil)
-	_ = l.Init(logger)
+	require.NoError(t, l.Init(logger))
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	e := make(chan bool)
 	l.establish = func(id string, c net.Conn) error {
@@ -115,7 +115,8 @@ func TestWebsocketUpgrade(t *testing.T) {
 
 func TestWebsocketConnectionReads(t *testing.T) {
 	l := NewWebsocket("t1", testAddr, nil)
-	_ = l.Init(nil)
+	require.NoError(t, l.Init(nil))
+	t.Cleanup(func() { l.Close(MockCloser) })
 
 	recv := make(chan []byte)
 	l.establish = func(id string, c net.Conn) error {
@@ -152,4 +153,24 @@ func TestWebsocketConnectionReads(t *testing.T) {
 
 	s.Close()
 	_ = ws.Close()
+}
+
+func TestWebsocketInitAddressInUse(t *testing.T) {
+	ln, err := net.Listen("tcp", testAddr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+
+	l := NewWebsocket("t1", testAddr, nil)
+	require.Error(t, l.Init(logger))
+}
+
+func TestWebsocketCloseWithoutServe(t *testing.T) {
+	l := NewWebsocket("t1", testAddr, nil)
+	require.NoError(t, l.Init(logger))
+	l.Close(MockCloser)
+
+	// the port is free again even though Serve never ran
+	ln, err := net.Listen("tcp", testAddr)
+	require.NoError(t, err)
+	_ = ln.Close()
 }

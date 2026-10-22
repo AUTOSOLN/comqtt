@@ -629,6 +629,7 @@ func TestEstablishConnectionInheritExistingTrueTakeover(t *testing.T) {
 
 	_, _ = w2.Write(packets.TPacketData[packets.Disconnect].Get(packets.TDisconnect).RawBytes)
 	require.NoError(t, <-o2)
+	requireInfoCounts(t, s)
 }
 
 func TestEstablishConnectionResentPendingInflightsError(t *testing.T) {
@@ -722,6 +723,7 @@ func TestEstablishConnectionInheritExistingClean(t *testing.T) {
 	clw, ok := s.Clients.Get(packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt311).Packet.Connect.ClientIdentifier)
 	require.True(t, ok)
 	require.Equal(t, 0, clw.State.Subscriptions.Len())
+	requireInfoCounts(t, s)
 }
 
 func TestEstablishConnectionBadAuthentication(t *testing.T) {
@@ -1095,6 +1097,21 @@ func addSentInflights(s *Server, cl *Client) {
 	}
 }
 
+// requireInfoCounts checks that Info's subscription, inflight and retained
+// counters match the state they count.
+func requireInfoCounts(t *testing.T, s *Server) {
+	t.Helper()
+
+	var inflight int64
+	for _, cl := range s.Clients.GetAll() {
+		inflight += int64(cl.State.Inflight.Len() + cl.State.InboundInflight.Len())
+	}
+
+	require.Equal(t, int64(s.Topics.SubscriptionCount()), atomic.LoadInt64(&s.Info.Subscriptions), "subscriptions")
+	require.Equal(t, inflight, atomic.LoadInt64(&s.Info.Inflight), "inflight")
+	require.Equal(t, int64(s.Topics.Retained.Len()), atomic.LoadInt64(&s.Info.Retained), "retained")
+}
+
 func TestInheritClientSessionKeepsInflightCount(t *testing.T) {
 	s := newServer()
 	existing := newInflightTakeoverClient(s)
@@ -1109,6 +1126,7 @@ func TestInheritClientSessionKeepsInflightCount(t *testing.T) {
 		require.NoError(t, s.processPuback(cl, packets.Packet{PacketID: id}))
 	}
 	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+	requireInfoCounts(t, s)
 }
 
 func TestInheritClientSessionRepeatedTakeovers(t *testing.T) {
@@ -1129,6 +1147,7 @@ func TestInheritClientSessionRepeatedTakeovers(t *testing.T) {
 		require.NoError(t, s.processPuback(cl, packets.Packet{PacketID: id}))
 	}
 	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+	requireInfoCounts(t, s)
 }
 
 func TestInheritClientSessionCleanDropsInflightCount(t *testing.T) {
@@ -1140,6 +1159,7 @@ func TestInheritClientSessionCleanDropsInflightCount(t *testing.T) {
 	cl := newInflightTakeoverClient(s)
 	require.False(t, s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "mochi", Clean: true}}, cl))
 	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+	requireInfoCounts(t, s)
 }
 
 // byCidHistoryHook answers StoredSubscriptionsByCid/StoredInflightMessagesByCid
@@ -2128,6 +2148,7 @@ func TestPublishToClientExceedClientWritesPendingInflightCount(t *testing.T) {
 			require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
 			require.Equal(t, 0, cl.State.Inflight.Len())
 			require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
+			requireInfoCounts(t, s)
 		})
 	}
 }
@@ -2143,6 +2164,7 @@ func TestPublishToClientDirectWriteFailureInflightCount(t *testing.T) {
 	require.ErrorIs(t, err, io.ErrClosedPipe)
 	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
 	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
+	requireInfoCounts(t, s)
 }
 
 func TestPublishToClientServerTopicAlias(t *testing.T) {
@@ -3515,6 +3537,7 @@ func TestServerLoadInflightMessagesByRecipient(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, 0, zen.State.Inflight.Len())
 	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.Inflight))
+	requireInfoCounts(t, s)
 }
 
 func TestServerLoadInflightMessagesSkipsUnknownRecipient(t *testing.T) {
@@ -3545,6 +3568,7 @@ func TestServerLoadInflightMessagesSkipsUnknownRecipient(t *testing.T) {
 			require.True(t, ok)
 			require.Equal(t, 0, zen.State.Inflight.Len())
 			require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.Inflight))
+			requireInfoCounts(t, s)
 		})
 	}
 }
@@ -3759,6 +3783,7 @@ func TestServerCloseWaitsForClientCleanup(t *testing.T) {
 	require.True(t, hook.unsubscribed)
 	_, ok := s.Clients.Get("zen")
 	require.False(t, ok)
+	requireInfoCounts(t, s)
 }
 
 func TestServerClearExpiredInflights(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/wind-c/comqtt/v2/mqtt"
@@ -39,8 +40,8 @@ func retainedKey(topic string) string {
 }
 
 // inflightKeyPrefix returns the primary-key prefix shared by every inflight
-// message stored for a given client id, so a by-cid lookup can be expressed as
-// a prefix match on storage.Message.ID without a dedicated recipient field.
+// message stored for a given client id. Also matches ids that extend cid with
+// ':', so filter with inflightClientID.
 func inflightKeyPrefix(cid string) string {
 	return storage.InflightKey + "_" + cid + ":"
 }
@@ -90,6 +91,7 @@ func (h *Hook) ID() string {
 // Provides indicates which hook methods this hook provides.
 func (h *Hook) Provides(b byte) bool {
 	return bytes.Contains([]byte{
+		mqtt.OnSessionEstablish,
 		mqtt.OnSessionEstablished,
 		mqtt.OnDisconnect,
 		mqtt.OnSubscribed,
@@ -145,6 +147,18 @@ func (h *Hook) Init(config any) error {
 // Stop closes the badger instance.
 func (h *Hook) Stop() error {
 	return h.db.Close()
+}
+
+// OnSessionEstablish deletes the previous session's inflight messages on a clean start [MQTT-3.1.2-4].
+func (h *Hook) OnSessionEstablish(cl *mqtt.Client, pk packets.Packet) {
+	if h.db == nil {
+		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+		return
+	}
+
+	if pk.Connect.Clean {
+		h.deleteInflights(cl.ID)
+	}
 }
 
 // OnSessionEstablished adds a client to the store when their session is established.
@@ -397,7 +411,22 @@ func (h *Hook) OnRetainedExpired(filter string) {
 	}
 }
 
-// OnClientExpired deleted expired clients from the store.
+// deleteInflights deletes every stored inflight message for the client id.
+func (h *Hook) deleteInflights(cid string) {
+	msgs, err := h.StoredInflightMessagesByCid(cid)
+	if err != nil {
+		h.Log.Error("failed to read client inflight data", "error", err, "id", cid)
+		return
+	}
+
+	for _, m := range msgs {
+		if err = h.db.Delete(m.ID, new(storage.Message)); err != nil {
+			h.Log.Error("failed to delete client inflight data", "error", err, "id", m.ID)
+		}
+	}
+}
+
+// OnClientExpired deletes expired clients and their inflight messages from the store.
 func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	if h.db == nil {
 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
@@ -408,6 +437,8 @@ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	if err != nil {
 		h.Log.Error("failed to delete expired client data", "error", err, "id", clientKey(cl))
 	}
+
+	h.deleteInflights(cl.ID)
 }
 
 // StoredClients returns all stored clients from the store.
@@ -515,6 +546,11 @@ func (h *Hook) StoredInflightMessagesByCid(cid string) (v []storage.Message, err
 	if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
 		return
 	}
+
+	// the prefix for "a" also matches "a:b"'s rows
+	v = slices.DeleteFunc(v, func(m storage.Message) bool {
+		return inflightClientID(m.ID) != cid
+	})
 
 	return v, nil
 }

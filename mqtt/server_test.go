@@ -3549,6 +3549,54 @@ func TestServerLoadInflightMessagesSkipsUnknownRecipient(t *testing.T) {
 	}
 }
 
+func TestServerLoadInflightMessagesRestoresExpiry(t *testing.T) {
+	tt := []struct {
+		desc string
+		load func(s *Server, cl *Client, v []storage.Message)
+	}{
+		{
+			desc: "loadInflight",
+			load: func(s *Server, _ *Client, v []storage.Message) { s.loadInflight(v) },
+		},
+		{
+			desc: "loadInflightForClient",
+			load: func(s *Server, cl *Client, v []storage.Message) { s.loadInflightForClient(cl, v) },
+		},
+	}
+
+	for _, tx := range tt {
+		t.Run(tx.desc, func(t *testing.T) {
+			s := newServer()
+			s.Options.Capabilities.MaximumMessageExpiryInterval = 3600 // newServer sets 0
+			maxExpiry := s.Options.Capabilities.MaximumMessageExpiryInterval
+			s.loadClients([]storage.Client{{ID: "mochi"}})
+			mochi, ok := s.Clients.Get("mochi")
+			require.True(t, ok)
+
+			now := time.Now().Unix()
+			created := now - 100
+			tx.load(s, mochi, []storage.Message{
+				{ClientID: "mochi", PacketID: 1, TopicName: "a/b/c", Created: created, Properties: storage.MessageProperties{MessageExpiryInterval: 30}},
+				{ClientID: "mochi", PacketID: 2, TopicName: "a/b/c", Created: created},
+			})
+
+			pk, ok := mochi.State.Inflight.Get(1)
+			require.True(t, ok)
+			require.Equal(t, created+30, pk.Expiry)
+			pk, ok = mochi.State.Inflight.Get(2)
+			require.True(t, ok)
+			require.Equal(t, created+maxExpiry, pk.Expiry)
+			require.Equal(t, int64(2), atomic.LoadInt64(&s.Info.Inflight))
+
+			// only the message past its own 30s interval is dropped
+			require.Equal(t, []uint16{1}, mochi.ClearInflights(now, maxExpiry))
+			_, ok = mochi.State.Inflight.Get(2)
+			require.True(t, ok)
+			require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.Inflight))
+		})
+	}
+}
+
 // TestServerLoadInflightMessagesForClient verifies that loadInflightForClient
 // restores messages onto the client it is given, not the client named by
 // msg.Origin, which records the publisher rather than the recipient.

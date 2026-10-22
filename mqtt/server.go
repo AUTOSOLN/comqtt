@@ -1873,6 +1873,15 @@ func (s *Server) loadClients(v []storage.Client) {
 	}
 }
 
+// restoreInflightExpiry sets Expiry on an inflight packet restored from
+// storage, the same way PublishToSubscribers sets it on a new publish.
+func (s *Server) restoreInflightExpiry(pk *packets.Packet) {
+	pk.Expiry = pk.Created + s.Options.Capabilities.MaximumMessageExpiryInterval
+	if pk.Properties.MessageExpiryInterval > 0 {
+		pk.Expiry = pk.Created + int64(pk.Properties.MessageExpiryInterval)
+	}
+}
+
 // loadInflight restores inflight messages from the datastore onto their
 // recipient, msg.ClientID, which the storage hooks fill from their keys.
 // Messages without a known recipient are skipped and logged.
@@ -1889,7 +1898,9 @@ func (s *Server) loadInflight(v []storage.Message) {
 			continue
 		}
 
-		if ok := client.State.Inflight.Set(msg.ToPacket()); ok {
+		pk := msg.ToPacket()
+		s.restoreInflightExpiry(&pk)
+		if ok := client.State.Inflight.Set(pk); ok {
 			atomic.AddInt64(&s.Info.Inflight, 1)
 		}
 	}
@@ -1932,7 +1943,9 @@ func (s *Server) loadSubscriptionsForClient(cl *Client, v []storage.Subscription
 // not yet in s.Clients (this runs before s.Clients.Add in processConnect).
 func (s *Server) loadInflightForClient(cl *Client, v []storage.Message) {
 	for _, msg := range v {
-		if ok := cl.State.Inflight.Set(msg.ToPacket()); ok {
+		pk := msg.ToPacket()
+		s.restoreInflightExpiry(&pk)
+		if ok := cl.State.Inflight.Set(pk); ok {
 			atomic.AddInt64(&s.Info.Inflight, 1)
 		}
 	}

@@ -3300,6 +3300,45 @@ func TestServerLoadSubscriptions(t *testing.T) {
 	require.Equal(t, 3, cl.State.Subscriptions.Len())
 }
 
+func TestServerLoadSubscriptionsSkipsRefused(t *testing.T) {
+	v := []storage.Subscription{
+		{ID: "sub1", Client: "mochi", Filter: "a/b/c", Qos: 1},
+		{ID: "sub2", Client: "mochi", Filter: "d/e/f", Qos: 0x80},
+	}
+
+	s := newServer()
+	cl, _, _ := newTestClient()
+	s.Clients.Add(cl)
+	s.loadSubscriptions(v)
+
+	require.Equal(t, 1, cl.State.Subscriptions.Len())
+	_, ok := cl.State.Subscriptions.Get("a/b/c")
+	require.True(t, ok)
+	_, ok = cl.State.Subscriptions.Get("d/e/f")
+	require.False(t, ok)
+	require.Contains(t, s.Topics.Subscribers("a/b/c").Subscriptions, "mochi")
+	require.NotContains(t, s.Topics.Subscribers("d/e/f").Subscriptions, "mochi")
+}
+
+func TestServerLoadSubscriptionsForClientSkipsRefused(t *testing.T) {
+	v := []storage.Subscription{
+		{ID: "sub1", Client: "mochi", Filter: "a/b/c", Qos: 1},
+		{ID: "sub2", Client: "mochi", Filter: "d/e/f", Qos: 0x80},
+	}
+
+	s := newServer()
+	cl, _, _ := newTestClient()
+	s.loadSubscriptionsForClient(cl, v)
+
+	require.Equal(t, 1, cl.State.Subscriptions.Len())
+	_, ok := cl.State.Subscriptions.Get("a/b/c")
+	require.True(t, ok)
+	_, ok = cl.State.Subscriptions.Get("d/e/f")
+	require.False(t, ok)
+	require.Contains(t, s.Topics.Subscribers("a/b/c").Subscriptions, "mochi")
+	require.NotContains(t, s.Topics.Subscribers("d/e/f").Subscriptions, "mochi")
+}
+
 func TestServerLoadInflightMessages(t *testing.T) {
 	s := newServer()
 	s.loadClients([]storage.Client{

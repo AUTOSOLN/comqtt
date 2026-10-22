@@ -1787,6 +1787,11 @@ func (s *Server) loadSubscriptions(v []storage.Subscription) {
 			continue
 		}
 
+		// Refused subscriptions saved by older versions of the storage hooks; never subscribed or counted.
+		if sub.Qos >= packets.ErrUnspecifiedError.Code {
+			continue
+		}
+
 		sb := packets.Subscription{
 			Filter:            sub.Filter,
 			RetainHandling:    sub.RetainHandling,
@@ -1851,6 +1856,11 @@ func (s *Server) loadInflight(v []storage.Message) {
 func (s *Server) loadSubscriptionsForClient(cl *Client, v []storage.Subscription) {
 	for _, sub := range v {
 		if sub.Client == InlineClientId {
+			continue
+		}
+
+		// Refused subscriptions saved by older versions of the storage hooks; never subscribed or counted.
+		if sub.Qos >= packets.ErrUnspecifiedError.Code {
 			continue
 		}
 

@@ -30,7 +30,12 @@ func clientKey(cl *mqtt.Client) string {
 
 // subscriptionKey returns a primary key for a subscription.
 func subscriptionKey(cl *mqtt.Client, filter string) string {
-	return storage.SubscriptionKey + "_" + cl.ID + ":" + filter
+	return subscriptionKeyByID(cl.ID, filter)
+}
+
+// subscriptionKeyByID returns a primary key for a subscription from a client id.
+func subscriptionKeyByID(clientID, filter string) string {
+	return storage.SubscriptionKey + "_" + clientID + ":" + filter
 }
 
 // retainedKey returns a primary key for a retained message.
@@ -248,6 +253,16 @@ func (h *Hook) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []
 			h.Log.Error("failed to delete subscription data", "error", err, "data", subscriptionKey(cl, pk.Filters[i].Filter))
 		}
 	}
+}
+
+// DeleteSubscription removes a client's subscription row outside the hook lifecycle
+// (e.g. startup reconcile). Returns badgerhold.ErrNotFound if the row doesn't exist.
+func (h *Hook) DeleteSubscription(clientID, filter string) error {
+	if h.db == nil {
+		return storage.ErrDBFileNotOpen
+	}
+
+	return h.db.Delete(subscriptionKeyByID(clientID, filter), new(storage.Subscription))
 }
 
 // OnRetainMessage adds a retained message for a topic to the store.

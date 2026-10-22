@@ -52,6 +52,7 @@ func TestClientKey(t *testing.T) {
 func TestSubscriptionKey(t *testing.T) {
 	k := subscriptionKey(&mqtt.Client{ID: "cl1"}, "a/b/c")
 	require.Equal(t, storage.SubscriptionKey+"_cl1:a/b/c", k)
+	require.Equal(t, k, subscriptionKeyByID("cl1", "a/b/c"))
 }
 
 func TestRetainedKey(t *testing.T) {
@@ -298,6 +299,29 @@ func TestOnSubscribedSkipsRefusedFilters(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, subs, 1)
 	require.Equal(t, "a/b/c", subs[0].Filter)
+}
+
+func TestDeleteSubscription(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	h.OnSubscribed(client, pkf, []byte{0}, []int{0})
+	require.NoError(t, h.DeleteSubscription(client.ID, pkf.Filters[0].Filter))
+
+	subs, err := h.StoredSubscriptions()
+	require.NoError(t, err)
+	require.Empty(t, subs)
+
+	require.ErrorIs(t, h.DeleteSubscription(client.ID, "x/y/z"), badgerhold.ErrNotFound)
+}
+
+func TestDeleteSubscriptionNoDB(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	require.ErrorIs(t, h.DeleteSubscription("cl1", "a/b/c"), storage.ErrDBFileNotOpen)
 }
 
 func TestOnSubscribedNoDB(t *testing.T) {

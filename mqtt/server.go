@@ -1991,6 +1991,7 @@ func (s *Server) clearExpiredRetainedMessages(now int64) {
 			s.hooks.OnRetainedExpired(filter)
 		}
 	}
+	atomic.StoreInt64(&s.Info.Retained, int64(s.Topics.Retained.Len()))
 }
 
 // clearExpiredInflights deletes any inflight messages which have expired.

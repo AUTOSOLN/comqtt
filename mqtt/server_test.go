@@ -3928,8 +3928,11 @@ func TestServerClearExpiredRetained(t *testing.T) {
 	s.Topics.Retained.Add("m/n/o", packets.Packet{Created: n})
 
 	require.Len(t, s.Topics.Retained.GetAll(), 5)
+	atomic.StoreInt64(&s.Info.Retained, int64(s.Topics.Retained.Len())) // as retainMessage would have
 	s.clearExpiredRetainedMessages(n)
 	require.Len(t, s.Topics.Retained.GetAll(), 2)
+	require.Equal(t, int64(2), atomic.LoadInt64(&s.Info.Retained))
+	requireInfoCounts(t, s)
 }
 
 func TestServerClearExpiredClients(t *testing.T) {

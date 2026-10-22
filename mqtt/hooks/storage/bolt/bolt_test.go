@@ -718,6 +718,52 @@ func TestStoredInflightMessagesClosedDB(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestStoredInflightMessagesClientID(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	// "a:b" checks the split is at the last ':'; hand-written rows come back with no client id
+	h.OnQosPublish(&mqtt.Client{ID: "zen"}, packets.Packet{PacketID: 1, Origin: "mochi"}, time.Now().Unix(), 0)
+	h.OnQosPublish(&mqtt.Client{ID: "a:b"}, packets.Packet{PacketID: 2, Origin: "mochi"}, time.Now().Unix(), 0)
+	for _, id := range []string{"i1", storage.InflightKey + "_zen"} {
+		err = h.db.Save(&storage.Message{ID: id, T: storage.InflightKey})
+		require.NoError(t, err)
+	}
+
+	r, err := h.StoredInflightMessages()
+	require.NoError(t, err)
+	got := map[string]string{}
+	for _, m := range r {
+		got[m.ID] = m.ClientID
+	}
+	require.Equal(t, map[string]string{
+		storage.InflightKey + "_zen:1": "zen",
+		storage.InflightKey + "_a:b:2": "a:b",
+		"i1":                           "",
+		storage.InflightKey + "_zen":   "",
+	}, got)
+}
+
+func TestStoredInflightMessagesClientIDNotStored(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	err = h.db.Save(&storage.Message{ID: "i1", T: storage.InflightKey, ClientID: "zen"})
+	require.NoError(t, err)
+
+	var m storage.Message
+	err = h.db.One("ID", "i1", &m)
+	require.NoError(t, err)
+	require.Equal(t, "i1", m.ID)
+	require.Empty(t, m.ClientID)
+}
+
 func TestStoredSysInfo(t *testing.T) {
 	h := new(Hook)
 	h.SetOpts(logger, nil)

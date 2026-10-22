@@ -8,6 +8,7 @@ package bolt
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/wind-c/comqtt/v2/mqtt"
@@ -46,6 +47,20 @@ func retainedKey(topic string) string {
 // inflightKey returns a primary key for an inflight message.
 func inflightKey(cl *mqtt.Client, pk packets.Packet) string {
 	return storage.InflightKey + "_" + cl.ID + ":" + pk.FormatID()
+}
+
+// inflightClientID returns the client id from an inflightKey key (everything before
+// the last ':', since packet ids are numeric), or "" if the key is malformed.
+func inflightClientID(key string) string {
+	rest, ok := strings.CutPrefix(key, storage.InflightKey+"_")
+	if !ok {
+		return ""
+	}
+	i := strings.LastIndex(rest, ":")
+	if i < 0 {
+		return ""
+	}
+	return rest[:i]
 }
 
 // sysInfoKey returns a primary key for system info.
@@ -445,6 +460,10 @@ func (h *Hook) StoredInflightMessages() (v []storage.Message, err error) {
 	err = h.db.Find("T", storage.InflightKey, &v)
 	if err != nil && !errors.Is(err, storm.ErrNotFound) {
 		return
+	}
+
+	for i := range v {
+		v[i].ClientID = inflightClientID(v[i].ID)
 	}
 
 	return v, nil

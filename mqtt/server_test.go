@@ -1154,14 +1154,40 @@ func TestInheritClientSessionRepeatedTakeovers(t *testing.T) {
 
 func TestInheritClientSessionCleanDropsInflightCount(t *testing.T) {
 	s := newServer()
+	hook := new(qosDroppedHook)
+	require.NoError(t, s.AddHook(hook, nil))
+
 	existing := newInflightTakeoverClient(s)
+	existing.ops.hooks = s.hooks
 	addSentInflights(s, existing)
 	s.Clients.Add(existing)
 
 	cl := newInflightTakeoverClient(s)
 	require.False(t, s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "mochi", Clean: true}}, cl))
+	require.Equal(t, int32(0), hook.dropped.Load()) // the stores delete the rows in OnSessionEstablish
 	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
 	require.Equal(t, int64(3), atomic.LoadInt64(&s.Info.InflightDropped))
+	requireInfoCounts(t, s)
+}
+
+func TestInheritClientSessionV3CleanCopyDropsInflights(t *testing.T) {
+	s := newServer()
+	hook := new(qosDroppedHook)
+	require.NoError(t, s.AddHook(hook, nil))
+
+	existing := newInflightTakeoverClient(s)
+	existing.ops.hooks = s.hooks // so OnQosDropped reaches the recording hook
+	existing.Properties.ProtocolVersion = 4
+	existing.Properties.Clean = true
+	addSentInflights(s, existing)
+	s.Clients.Add(existing)
+
+	// clean start 0: OnSessionEstablish deletes nothing, so the drop must reach the stores
+	cl := newInflightTakeoverClient(s)
+	require.False(t, s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "mochi"}}, cl))
+	require.Equal(t, int32(3), hook.dropped.Load())
+	require.Equal(t, int64(3), atomic.LoadInt64(&s.Info.InflightDropped))
+	require.Equal(t, 0, existing.State.Inflight.Len())
 	requireInfoCounts(t, s)
 }
 

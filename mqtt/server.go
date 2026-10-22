@@ -1873,13 +1873,24 @@ func (s *Server) loadClients(v []storage.Client) {
 	}
 }
 
-// loadInflight restores inflight messages from the datastore.
+// loadInflight restores inflight messages from the datastore onto their
+// recipient, msg.ClientID, which the storage hooks fill from their keys.
+// Messages without a known recipient are skipped and logged.
 func (s *Server) loadInflight(v []storage.Message) {
 	for _, msg := range v {
-		if client, ok := s.Clients.Get(msg.Origin); ok {
-			if ok := client.State.Inflight.Set(msg.ToPacket()); ok {
-				atomic.AddInt64(&s.Info.Inflight, 1)
-			}
+		if msg.ClientID == "" {
+			s.Log.Warn("skipping restored inflight message with no recipient", "id", msg.ID, "origin", msg.Origin)
+			continue
+		}
+
+		client, ok := s.Clients.Get(msg.ClientID)
+		if !ok {
+			s.Log.Warn("skipping restored inflight message for unknown client", "id", msg.ID, "client", msg.ClientID)
+			continue
+		}
+
+		if ok := client.State.Inflight.Set(msg.ToPacket()); ok {
+			atomic.AddInt64(&s.Info.Inflight, 1)
 		}
 	}
 }
@@ -1916,14 +1927,9 @@ func (s *Server) loadSubscriptionsForClient(cl *Client, v []storage.Subscription
 	}
 }
 
-// loadInflightForClient restores inflight messages queued for a single, known
-// client. Unlike loadInflight (used for the bulk, all-clients restore at
-// startup), the recipient here is cl itself — the caller already knows it
-// from the StoredInflightMessagesByCid(cid) query that produced v — not
-// msg.Origin, which records who originally published the message and is
-// often a different client than the one the message is queued for. cl is
-// passed directly rather than looked up via s.Clients.Get(cid); see
-// loadClientHistory's doc comment for why that lookup would fail here.
+// loadInflightForClient restores v into cl's inflight state. v must already be
+// filtered to cl; msg.ClientID is not checked. cl is passed in because it is
+// not yet in s.Clients (this runs before s.Clients.Add in processConnect).
 func (s *Server) loadInflightForClient(cl *Client, v []storage.Message) {
 	for _, msg := range v {
 		if ok := cl.State.Inflight.Set(msg.ToPacket()); ok {

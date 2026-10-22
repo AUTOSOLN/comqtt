@@ -3475,10 +3475,10 @@ func TestServerLoadInflightMessages(t *testing.T) {
 	require.Equal(t, 3, s.Clients.Len())
 
 	v := []storage.Message{
-		{Origin: "mochi", PacketID: 1, Payload: []byte("hello world"), TopicName: "a/b/c"},
-		{Origin: "mochi", PacketID: 2, Payload: []byte("yes"), TopicName: "a/b/c"},
-		{Origin: "zen", PacketID: 3, Payload: []byte("hello world"), TopicName: "a/b/c"},
-		{Origin: "mochi-co", PacketID: 4, Payload: []byte("hello world"), TopicName: "a/b/c"},
+		{Origin: "mochi", ClientID: "mochi", PacketID: 1, Payload: []byte("hello world"), TopicName: "a/b/c"},
+		{Origin: "mochi", ClientID: "mochi", PacketID: 2, Payload: []byte("yes"), TopicName: "a/b/c"},
+		{Origin: "zen", ClientID: "zen", PacketID: 3, Payload: []byte("hello world"), TopicName: "a/b/c"},
+		{Origin: "mochi-co", ClientID: "mochi-co", PacketID: 4, Payload: []byte("hello world"), TopicName: "a/b/c"},
 	}
 	s.loadInflight(v)
 
@@ -3497,18 +3497,61 @@ func TestServerLoadInflightMessages(t *testing.T) {
 	require.True(t, ok)
 }
 
-// Regression test: loadInflightForClient must restore messages onto the
-// client it was explicitly asked to restore for, not onto whichever client
-// happens to match msg.Origin. Origin records who originally published a
-// message, which is frequently a different client than the one the message is
-// queued for (e.g. clientA publishes to a topic clientB is subscribed to;
-// clientB's queued copy has Origin "clientA"). loadInflight (the generic,
-// bulk, all-clients restore used at startup) is the one that relies on
-// Origin, and is intentionally left alone; loadInflightForClient is the
-// recipient-aware variant used by loadClientHistory, which passes the
-// reconnecting *Client directly (see that function's doc comment for why a
-// s.Clients.Get(cid) lookup — the previous shape of this function — doesn't
-// work for its one real caller).
+func TestServerLoadInflightMessagesByRecipient(t *testing.T) {
+	s := newServer()
+	s.loadClients([]storage.Client{{ID: "mochi"}, {ID: "zen"}})
+
+	// published by "zen", queued for "mochi"
+	s.loadInflight([]storage.Message{
+		{Origin: "zen", ClientID: "mochi", PacketID: 1, Payload: []byte("hello world"), TopicName: "a/b/c"},
+	})
+
+	mochi, ok := s.Clients.Get("mochi")
+	require.True(t, ok)
+	_, ok = mochi.State.Inflight.Get(1)
+	require.True(t, ok)
+
+	zen, ok := s.Clients.Get("zen")
+	require.True(t, ok)
+	require.Equal(t, 0, zen.State.Inflight.Len())
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.Inflight))
+}
+
+func TestServerLoadInflightMessagesSkipsUnknownRecipient(t *testing.T) {
+	tt := []struct {
+		desc     string
+		clientID string
+	}{
+		{desc: "unknown client", clientID: "ghost"},
+		{desc: "no recipient", clientID: ""},
+	}
+
+	for _, tx := range tt {
+		t.Run(tx.desc, func(t *testing.T) {
+			s := newServer()
+			s.loadClients([]storage.Client{{ID: "mochi"}, {ID: "zen"}})
+
+			s.loadInflight([]storage.Message{
+				{Origin: "zen", ClientID: tx.clientID, PacketID: 1, TopicName: "a/b/c"},
+				{Origin: "zen", ClientID: "mochi", PacketID: 2, TopicName: "a/b/c"},
+			})
+
+			mochi, ok := s.Clients.Get("mochi")
+			require.True(t, ok)
+			require.Equal(t, 1, mochi.State.Inflight.Len())
+
+			// "zen" is the Origin and must not be used as a fallback
+			zen, ok := s.Clients.Get("zen")
+			require.True(t, ok)
+			require.Equal(t, 0, zen.State.Inflight.Len())
+			require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.Inflight))
+		})
+	}
+}
+
+// TestServerLoadInflightMessagesForClient verifies that loadInflightForClient
+// restores messages onto the client it is given, not the client named by
+// msg.Origin, which records the publisher rather than the recipient.
 func TestServerLoadInflightMessagesForClient(t *testing.T) {
 	s := newServer()
 	s.loadClients([]storage.Client{
@@ -3521,9 +3564,7 @@ func TestServerLoadInflightMessagesForClient(t *testing.T) {
 	mochi, ok := s.Clients.Get("mochi")
 	require.True(t, ok)
 
-	// both messages were originally published by "zen", but are queued
-	// (recipient) for "mochi" -- Origin must not be used to resolve the
-	// recipient here.
+	// published by "zen", queued for "mochi"
 	v := []storage.Message{
 		{Origin: "zen", PacketID: 1, Payload: []byte("hello world"), TopicName: "a/b/c"},
 		{Origin: "zen", PacketID: 2, Payload: []byte("yes"), TopicName: "a/b/c"},

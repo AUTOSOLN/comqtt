@@ -467,6 +467,29 @@ func (x *TopicsIndex) Unsubscribe(filter, client string) (bool, int) {
 	return existed, count
 }
 
+// SubscriptionCount returns the number of normal and shared client subscriptions (matching Info.Subscriptions).
+// It walks the whole tree under the root lock, so use it for startup reconciliation, not hot paths.
+func (x *TopicsIndex) SubscriptionCount() int {
+	x.root.Lock()
+	defer x.root.Unlock()
+
+	// the root's shared map is nil and nothing subscribes at the root, so start from its children.
+	n := 0
+	for _, p := range x.root.particles.getAll() {
+		n += countSubscriptions(p)
+	}
+	return n
+}
+
+// countSubscriptions returns the normal and shared subscriptions at p and below.
+func countSubscriptions(p *particle) int {
+	n := p.subscriptions.Len() + p.shared.Len()
+	for _, child := range p.particles.getAll() {
+		n += countSubscriptions(child)
+	}
+	return n
+}
+
 // RetainMessage saves a message payload to the end of a topic address. Returns
 // 1 if a retained message was added, and -1 if the retained message was removed.
 // 0 is returned if sequential empty payloads are received.

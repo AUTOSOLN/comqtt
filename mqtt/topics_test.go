@@ -388,6 +388,29 @@ func TestUnsubscribeKeepsParentInline(t *testing.T) {
 	require.True(t, exists)
 }
 
+func TestSubscriptionCount(t *testing.T) {
+	handler := func(cl *Client, sub packets.Subscription, pk packets.Packet) {}
+	index := NewTopicsIndex()
+	require.Equal(t, 0, index.SubscriptionCount())
+
+	index.Subscribe("cl1", packets.Subscription{Filter: "a"})
+	index.Subscribe("cl1", packets.Subscription{Filter: "a/b"})
+	index.Subscribe("cl1", packets.Subscription{Filter: "a/b/c"})
+	index.Subscribe("cl1", packets.Subscription{Filter: "a/+/c"})
+	index.Subscribe("cl1", packets.Subscription{Filter: "#"})
+	index.Subscribe("cl1", packets.Subscription{Filter: "$share/g1/a/b"})
+	index.Subscribe("cl2", packets.Subscription{Filter: "$share/g1/a/b"})
+	index.Subscribe("cl3", packets.Subscription{Filter: "$share/g2/a/b"})
+	index.InlineSubscribe(InlineSubscription{Handler: handler, Subscription: packets.Subscription{Filter: "a/b", Identifier: 1}})
+	index.InlineSubscribe(InlineSubscription{Handler: handler, Subscription: packets.Subscription{Filter: "#", Identifier: 2}})
+	require.Equal(t, 8, index.SubscriptionCount())
+
+	index.Unsubscribe("a/b/c", "cl1")
+	index.Unsubscribe("$share/g1/a/b", "cl2")
+	index.InlineUnsubscribe(1, "a/b")
+	require.Equal(t, 6, index.SubscriptionCount())
+}
+
 func BenchmarkUnsubscribe(b *testing.B) {
 	index := NewTopicsIndex()
 

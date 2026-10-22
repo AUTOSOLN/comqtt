@@ -7,6 +7,7 @@ package bolt
 import (
 	"log/slog"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -74,6 +75,7 @@ func TestID(t *testing.T) {
 
 func TestProvides(t *testing.T) {
 	h := new(Hook)
+	require.True(t, h.Provides(mqtt.OnSessionEstablish))
 	require.True(t, h.Provides(mqtt.OnSessionEstablished))
 	require.True(t, h.Provides(mqtt.OnDisconnect))
 	require.True(t, h.Provides(mqtt.OnSubscribed))
@@ -209,6 +211,66 @@ func TestOnClientExpired(t *testing.T) {
 	err = h.db.One("ID", clientKey, r)
 	require.Error(t, err)
 	require.ErrorIs(t, storm.ErrNotFound, err)
+}
+
+func TestOnClientExpiredDeletesInflights(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	a := &mqtt.Client{ID: "a"}
+	h.OnSessionEstablished(a, packets.Packet{})
+	for i, cl := range []*mqtt.Client{a, a, {ID: "a:b"}, {ID: "zen"}} {
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+	}
+
+	h.OnClientExpired(a)
+
+	r, err := h.StoredInflightMessages()
+	require.NoError(t, err)
+	got := []string{}
+	for _, m := range r {
+		got = append(got, m.ClientID)
+	}
+	require.ElementsMatch(t, []string{"a:b", "zen"}, got)
+
+	err = h.db.One("ID", clientKey(a), new(storage.Client))
+	require.ErrorIs(t, err, storm.ErrNotFound)
+}
+
+func TestOnSessionEstablishCleanDeletesInflights(t *testing.T) {
+	for _, tc := range []struct {
+		clean bool
+		want  []string
+	}{
+		{clean: true, want: []string{"a:b", "zen"}},
+		{clean: false, want: []string{"a", "a", "a:b", "zen"}},
+	} {
+		t.Run(strconv.FormatBool(tc.clean), func(t *testing.T) {
+			h := new(Hook)
+			h.SetOpts(logger, nil)
+			err := h.Init(nil)
+			require.NoError(t, err)
+			defer teardown(t, h.config.Path, h)
+
+			a := &mqtt.Client{ID: "a"}
+			for i, cl := range []*mqtt.Client{a, a, {ID: "a:b"}, {ID: "zen"}} {
+				h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+			}
+
+			h.OnSessionEstablish(a, packets.Packet{Connect: packets.ConnectParams{Clean: tc.clean}})
+
+			r, err := h.StoredInflightMessages()
+			require.NoError(t, err)
+			got := []string{}
+			for _, m := range r {
+				got = append(got, m.ClientID)
+			}
+			require.ElementsMatch(t, tc.want, got)
+		})
+	}
 }
 
 func TestOnClientExpiredClosedDB(t *testing.T) {

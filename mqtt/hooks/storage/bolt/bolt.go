@@ -89,6 +89,7 @@ func (h *Hook) ID() string {
 // Provides indicates which hook methods this hook provides.
 func (h *Hook) Provides(b byte) bool {
 	return bytes.Contains([]byte{
+		mqtt.OnSessionEstablish,
 		mqtt.OnSessionEstablished,
 		mqtt.OnDisconnect,
 		mqtt.OnSubscribed,
@@ -141,6 +142,18 @@ func (h *Hook) Init(config any) error {
 // Stop closes the boltdb instance.
 func (h *Hook) Stop() error {
 	return h.db.Close()
+}
+
+// OnSessionEstablish deletes the previous session's inflight messages on a clean start [MQTT-3.1.2-4].
+func (h *Hook) OnSessionEstablish(cl *mqtt.Client, pk packets.Packet) {
+	if h.db == nil {
+		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+		return
+	}
+
+	if pk.Connect.Clean {
+		h.deleteInflights(cl.ID)
+	}
 }
 
 // OnSessionEstablished adds a client to the store when their session is established.
@@ -392,7 +405,7 @@ func (h *Hook) OnRetainedExpired(filter string) {
 	}
 }
 
-// OnClientExpired deleted expired clients from the store.
+// OnClientExpired deletes expired clients and their inflight messages from the store.
 func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	if h.db == nil {
 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
@@ -402,6 +415,28 @@ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	err := h.db.DeleteStruct(&storage.Client{ID: clientKey(cl)})
 	if err != nil && !errors.Is(err, storm.ErrNotFound) {
 		h.Log.Error("failed to delete expired client", "error", err, "id", clientKey(cl))
+	}
+
+	h.deleteInflights(cl.ID)
+}
+
+// deleteInflights deletes every stored inflight message for the client id.
+func (h *Hook) deleteInflights(cid string) {
+	// full scan of inflight rows per call; add a by-client index if expiry or
+	// clean-start volume makes it matter.
+	msgs, err := h.StoredInflightMessages()
+	if err != nil {
+		h.Log.Error("failed to read client inflight data", "error", err, "id", cid)
+		return
+	}
+
+	for _, m := range msgs {
+		if m.ClientID != cid {
+			continue
+		}
+		if err = h.db.DeleteStruct(&storage.Message{ID: m.ID}); err != nil {
+			h.Log.Error("failed to delete client inflight data", "error", err, "id", m.ID)
+		}
 	}
 }
 

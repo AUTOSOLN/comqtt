@@ -211,7 +211,8 @@ func initStorage(server *mqtt.Server, conf *config.Config) {
 		onError(config.ErrStorageWay, logMsg)
 	}
 	err := server.AddHook(new(coredis.Storage), &coredis.Options{
-		HPrefix: conf.Redis.HPrefix,
+		HPrefix:  conf.Redis.HPrefix,
+		NodeName: conf.Cluster.NodeName,
 		Options: &redis.Options{
 			Addr:     conf.Redis.Options.Addr,
 			DB:       conf.Redis.Options.DB,

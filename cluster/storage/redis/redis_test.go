@@ -48,6 +48,7 @@ func newHook(t *testing.T, addr string) *Storage {
 	s.SetOpts(logger, nil)
 
 	err := s.Init(&Options{
+		NodeName: "c01",
 		Options: &redis.Options{
 			Addr: addr,
 		},
@@ -62,6 +63,39 @@ func teardown(t *testing.T, s *Storage) {
 		err := s.db.FlushAll(s.ctx).Err()
 		require.NoError(t, err)
 		s.Stop()
+	}
+}
+
+// seedSession stores a client row, one subscription and one inflight for cid, owned by this node.
+func seedSession(s *Storage, cid string) *mqtt.Client {
+	cl := &mqtt.Client{ID: cid}
+	s.OnSessionEstablish(cl, packets.Packet{})
+	s.OnSessionEstablished(cl, packets.Packet{})
+	s.OnSubscribed(cl, pkf, []byte{0}, []int{1})
+	s.OnQosPublish(cl, packets.Packet{PacketID: 1}, time.Now().Unix(), 0)
+	return cl
+}
+
+// requireStoredSession checks that cid's client row, subscription and inflight are
+// all stored, or all gone.
+func requireStoredSession(t *testing.T, s *Storage, cid string, stored bool) {
+	t.Helper()
+
+	exists, err := s.db.HExists(s.ctx, s.hKey(storage.ClientKey), cid).Result()
+	require.NoError(t, err)
+	require.Equal(t, stored, exists, "client row")
+
+	// what loadClientHistory reads on reconnect
+	subs, err := s.StoredSubscriptionsByCid(cid)
+	require.NoError(t, err)
+	inflights, err := s.StoredInflightMessagesByCid(cid)
+	require.NoError(t, err)
+	if stored {
+		require.Len(t, subs, 1, "subscriptions")
+		require.Len(t, inflights, 1, "inflights")
+	} else {
+		require.Empty(t, subs, "subscriptions")
+		require.Empty(t, inflights, "inflights")
 	}
 }
 
@@ -94,6 +128,7 @@ func TestID(t *testing.T) {
 func TestProvides(t *testing.T) {
 	s := new(Storage)
 	s.SetOpts(logger, nil)
+	require.True(t, s.Provides(mqtt.OnSessionEstablish))
 	require.True(t, s.Provides(mqtt.OnSessionEstablished))
 	require.True(t, s.Provides(mqtt.OnDisconnect))
 	require.True(t, s.Provides(mqtt.OnSubscribed))
@@ -125,14 +160,24 @@ func TestInitUseDefaults(t *testing.T) {
 	m.StartAddr(defaultAddr)
 	defer m.Close()
 
-	s := newHook(t, defaultAddr)
+	s := new(Storage)
 	s.SetOpts(logger, nil)
-	err := s.Init(nil)
+	err := s.Init(&Options{NodeName: "c01", Options: &redis.Options{Addr: defaultAddr}})
 	require.NoError(t, err)
 	defer teardown(t, s)
 
 	require.Equal(t, defaultHPrefix+":", s.config.HPrefix)
 	require.Equal(t, defaultAddr, s.config.Options.Addr)
+}
+
+func TestInitRequiresNodeName(t *testing.T) {
+	m := miniredis.RunT(t)
+	defer m.Close()
+	s := new(Storage)
+	s.SetOpts(logger, nil)
+
+	require.Error(t, s.Init(nil))
+	require.Error(t, s.Init(&Options{Options: &redis.Options{Addr: m.Addr()}}))
 }
 
 func TestInitBadConfig(t *testing.T) {
@@ -147,6 +192,7 @@ func TestInitBadAddr(t *testing.T) {
 	s := new(Storage)
 	s.SetOpts(logger, nil)
 	err := s.Init(&Options{
+		NodeName: "c01",
 		Options: &redis.Options{
 			Addr: "abc:123",
 		},
@@ -160,6 +206,7 @@ func TestOnSessionEstablishedThenOnDisconnect(t *testing.T) {
 	s := newHook(t, m.Addr())
 	defer teardown(t, s)
 
+	s.OnSessionEstablish(client, packets.Packet{})
 	s.OnSessionEstablished(client, packets.Packet{})
 
 	r := new(storage.Client)
@@ -189,6 +236,40 @@ func TestOnSessionEstablishedThenOnDisconnect(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, redis.Nil)
 	require.Empty(t, r3.ID)
+}
+
+func TestOnSessionEstablishClaimsOwner(t *testing.T) {
+	m := miniredis.RunT(t)
+	defer m.Close()
+	s := newHook(t, m.Addr())
+	defer teardown(t, s)
+
+	s.OnSessionEstablish(&mqtt.Client{ID: "a"}, packets.Packet{})
+
+	owner, err := s.SessionOwner("a")
+	require.NoError(t, err)
+	require.Equal(t, "c01", owner)
+
+	owner, err = s.SessionOwner("zen")
+	require.NoError(t, err)
+	require.Empty(t, owner)
+}
+
+func TestOnSessionEstablishNoDB(t *testing.T) {
+	m := miniredis.RunT(t)
+	defer m.Close()
+	s := newHook(t, m.Addr())
+
+	s.db = nil
+	s.OnSessionEstablish(client, packets.Packet{})
+}
+
+func TestOnSessionEstablishClosedDB(t *testing.T) {
+	m := miniredis.RunT(t)
+	defer m.Close()
+	s := newHook(t, m.Addr())
+	teardown(t, s)
+	s.OnSessionEstablish(client, packets.Packet{})
 }
 
 func TestOnSessionEstablishedNoDB(t *testing.T) {
@@ -247,10 +328,72 @@ func TestOnClientExpired(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, clientKey, r.ID)
 
+	s.OnSessionEstablish(cl, packets.Packet{})
 	s.OnClientExpired(cl)
 	_, err = s.db.HGet(s.ctx, s.hKey(storage.ClientKey), clientKey).Result()
 	require.Error(t, err)
 	require.ErrorIs(t, redis.Nil, err)
+}
+
+func TestOnClientExpiredDeletesOwnedSession(t *testing.T) {
+	m := miniredis.RunT(t)
+	defer m.Close()
+	s := newHook(t, m.Addr())
+	defer teardown(t, s)
+
+	a := seedSession(s, "a")
+	seedSession(s, "a:b")
+
+	s.OnClientExpired(a)
+
+	requireStoredSession(t, s, "a", false)
+	requireStoredSession(t, s, "a:b", true)
+	owner, err := s.SessionOwner("a")
+	require.NoError(t, err)
+	require.Empty(t, owner)
+}
+
+func TestOnClientExpiredKeepsSessionNotOwned(t *testing.T) {
+	for name, owner := range map[string]string{"other node": "c02", "no owner": ""} {
+		t.Run(name, func(t *testing.T) {
+			m := miniredis.RunT(t)
+			defer m.Close()
+			s := newHook(t, m.Addr())
+			defer teardown(t, s)
+
+			a := seedSession(s, "a")
+			if owner == "" {
+				require.NoError(t, s.db.HDel(s.ctx, s.hKey(ownerKey), "a").Err())
+			} else {
+				require.NoError(t, s.db.HSet(s.ctx, s.hKey(ownerKey), "a", owner).Err())
+			}
+
+			s.OnClientExpired(a)
+
+			requireStoredSession(t, s, "a", true)
+		})
+	}
+}
+
+func TestOnDisconnectExpireDeletesOwnedSession(t *testing.T) {
+	m := miniredis.RunT(t)
+	defer m.Close()
+	s := newHook(t, m.Addr())
+	defer teardown(t, s)
+
+	a := seedSession(s, "a")
+
+	s.OnDisconnect(a, nil, false)
+	requireStoredSession(t, s, "a", true)
+
+	// the old copy of a session taken over on this node
+	taken := &mqtt.Client{ID: "a"}
+	taken.Stop(packets.ErrSessionTakenOver)
+	s.OnDisconnect(taken, nil, true)
+	requireStoredSession(t, s, "a", true)
+
+	s.OnDisconnect(a, nil, true)
+	requireStoredSession(t, s, "a", false)
 }
 
 func TestOnClientExpiredClosedDB(t *testing.T) {
@@ -291,6 +434,7 @@ func TestOnSubscribedThenOnUnsubscribed(t *testing.T) {
 	s := newHook(t, m.Addr())
 	defer teardown(t, s)
 
+	s.OnSessionEstablish(client, packets.Packet{})
 	s.OnSubscribed(client, pkf, []byte{0}, []int{1})
 
 	r := new(storage.Subscription)
@@ -304,6 +448,22 @@ func TestOnSubscribedThenOnUnsubscribed(t *testing.T) {
 	_, err = s.db.HGet(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, client.ID)), pkf.Filters[0].Filter).Result()
 	require.Error(t, err)
 	require.ErrorIs(t, err, redis.Nil)
+}
+
+func TestOnUnsubscribedKeepsSubscriptionsNotOwned(t *testing.T) {
+	m := miniredis.RunT(t)
+	defer m.Close()
+	s := newHook(t, m.Addr())
+	defer teardown(t, s)
+
+	a := seedSession(s, "a")
+	require.NoError(t, s.db.HSet(s.ctx, s.hKey(ownerKey), "a", "c02").Err())
+
+	s.OnUnsubscribed(a, pkf, []byte{0}, []int{0})
+
+	subs, err := s.StoredSubscriptionsByCid("a")
+	require.NoError(t, err)
+	require.Len(t, subs, 1)
 }
 
 func TestOnSubscribedSkipsRefusedFilters(t *testing.T) {

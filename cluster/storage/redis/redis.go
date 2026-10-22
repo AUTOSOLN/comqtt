@@ -24,7 +24,28 @@ const defaultAddr = "localhost:6379"
 // defaultHPrefix is a prefix to better identify hsets created by mochi mqtt.
 const defaultHPrefix = "comqtt"
 
+// ownerKey names the hash that records which node owns each client's session.
+const ownerKey = "owner"
+
 var localIP = "127.0.0.1"
+
+// discardScript deletes a client's owner field, client row, subscriptions and
+// inflights, only if this node owns the session.
+// KEYS: owner hash, client hash, sub:<cid>, ifm:<cid>. ARGV: cid, node.
+var discardScript = redis.NewScript(`
+if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+redis.call('HDEL', KEYS[1], ARGV[1])
+redis.call('HDEL', KEYS[2], ARGV[1])
+redis.call('DEL', KEYS[3], KEYS[4])
+return 1
+`)
+
+// unsubscribeScript deletes subscription filters, only if this node owns the session.
+// KEYS: owner hash, sub:<cid>. ARGV: cid, node, filter...
+var unsubscribeScript = redis.NewScript(`
+if redis.call('HGET', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+return redis.call('HDEL', KEYS[2], unpack(ARGV, 3))
+`)
 
 // clientKey returns a primary key for a client.
 func clientKey(cl *mqtt.Client) string {
@@ -53,8 +74,9 @@ func sysInfoKey() string {
 
 // Options contains configuration settings for the bolt instance.
 type Options struct {
-	HPrefix string `json:"prefix" yaml:"prefix"`
-	Options *redis.Options
+	HPrefix  string `json:"prefix" yaml:"prefix"`
+	NodeName string `json:"node-name" yaml:"node-name"` // this node's name, recorded as session owner
+	Options  *redis.Options
 }
 
 // Storage is a persistent storage hook based using Redis as a backend.
@@ -73,6 +95,7 @@ func (s *Storage) ID() string {
 // Provides indicates which hook methods this hook provides.
 func (s *Storage) Provides(b byte) bool {
 	return bytes.Contains([]byte{
+		mqtt.OnSessionEstablish,
 		mqtt.OnSessionEstablished,
 		mqtt.OnDisconnect,
 		mqtt.OnSubscribed,
@@ -116,6 +139,10 @@ func (s *Storage) Init(config any) error {
 	}
 
 	s.config = config.(*Options)
+	if s.config.NodeName == "" {
+		return errors.New("redis storage: node name is required")
+	}
+
 	if s.config.HPrefix == "" {
 		s.config.HPrefix = defaultHPrefix
 	}
@@ -142,6 +169,34 @@ func (s *Storage) Init(config any) error {
 func (s *Storage) Stop() error {
 	s.Log.Info("disconnecting from redis service")
 	return s.db.Close()
+}
+
+// OnSessionEstablish records this node as the session's owner before CONNACK, so
+// other nodes stop deleting its stored rows.
+func (s *Storage) OnSessionEstablish(cl *mqtt.Client, pk packets.Packet) {
+	if s.db == nil {
+		s.Log.Error("", "error", storage.ErrDBFileNotOpen)
+		return
+	}
+
+	err := s.db.HSet(s.ctx, s.hKey(ownerKey), clientKey(cl), s.config.NodeName).Err()
+	if err != nil {
+		s.Log.Error("failed to hset session owner", "error", err, "id", clientKey(cl))
+	}
+}
+
+// SessionOwner returns the node that owns the client's session, or "" if none is recorded.
+func (s *Storage) SessionOwner(cid string) (string, error) {
+	if s.db == nil {
+		return "", storage.ErrDBFileNotOpen
+	}
+
+	owner, err := s.db.HGet(s.ctx, s.hKey(ownerKey), cid).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", nil
+	}
+
+	return owner, err
 }
 
 // OnSessionEstablished adds a client to the store when their session is established.
@@ -190,7 +245,26 @@ func (s *Storage) updateClient(cl *mqtt.Client) {
 	}
 }
 
-// OnDisconnect removes a client from the store if they were using a clean session.
+// discard deletes the client's stored session if this node owns it.
+func (s *Storage) discard(cl *mqtt.Client) {
+	keys := []string{
+		s.hKey(ownerKey),
+		s.hKey(storage.ClientKey),
+		s.hKey(utils.JoinStrings(storage.SubscriptionKey, cl.ID)),
+		s.hKey(utils.JoinStrings(storage.InflightKey, cl.ID)),
+	}
+	n, err := discardScript.Run(s.ctx, s.db, keys, clientKey(cl), s.config.NodeName).Int()
+	if err != nil {
+		s.Log.Error("failed to delete client session", "error", err, "id", clientKey(cl))
+		return
+	}
+	if n == 0 {
+		s.Log.Debug("session not owned by this node, stored rows kept", "id", clientKey(cl))
+	}
+}
+
+// OnDisconnect removes a client's stored session when it ends with the connection,
+// if this node owns it.
 func (s *Storage) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 	if s.db == nil {
 		s.Log.Error("", "error", storage.ErrDBFileNotOpen)
@@ -201,10 +275,12 @@ func (s *Storage) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 		return
 	}
 
-	err := s.db.HDel(s.ctx, s.hKey(storage.ClientKey), clientKey(cl)).Err()
-	if err != nil {
-		s.Log.Error("failed to delete client", "error", err, "id", clientKey(cl))
+	// taken over on this node: the rows now belong to the new session
+	if errors.Is(cl.StopCause(), packets.ErrSessionTakenOver) {
+		return
 	}
+
+	s.discard(cl)
 }
 
 // OnSubscribed adds one or more client subscriptions to the store.
@@ -234,18 +310,27 @@ func (s *Storage) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes [
 	}
 }
 
-// OnUnsubscribed removes one or more client subscriptions from the store.
+// OnUnsubscribed removes one or more client subscriptions from the store, if this
+// node owns the session.
 func (s *Storage) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []byte, counts []int) {
 	if s.db == nil {
 		s.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
-	for i := 0; i < len(pk.Filters); i++ {
-		err := s.db.HDel(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, cl.ID)), pk.Filters[i].Filter).Err()
-		if err != nil {
-			s.Log.Error("failed to delete subscription data", "error", err, "id", clientKey(cl))
-		}
+	if len(pk.Filters) == 0 {
+		return
+	}
+
+	args := make([]any, 0, len(pk.Filters)+2)
+	args = append(args, clientKey(cl), s.config.NodeName)
+	for _, f := range pk.Filters {
+		args = append(args, f.Filter)
+	}
+
+	keys := []string{s.hKey(ownerKey), s.hKey(utils.JoinStrings(storage.SubscriptionKey, cl.ID))}
+	if err := unsubscribeScript.Run(s.ctx, s.db, keys, args...).Err(); err != nil {
+		s.Log.Error("failed to delete subscription data", "error", err, "id", clientKey(cl))
 	}
 }
 
@@ -375,17 +460,14 @@ func (s *Storage) OnRetainedExpired(filter string) {
 	}
 }
 
-// OnClientExpired deleted expired clients from the store.
+// OnClientExpired deletes an expired client's stored session, if this node owns it.
 func (s *Storage) OnClientExpired(cl *mqtt.Client) {
 	if s.db == nil {
 		s.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
-	err := s.db.HDel(s.ctx, s.hKey(storage.ClientKey), clientKey(cl)).Err()
-	if err != nil {
-		s.Log.Error("failed to delete expired client", "error", err, "id", clientKey(cl))
-	}
+	s.discard(cl)
 }
 
 // StoredSysInfo returns the system info from the store.

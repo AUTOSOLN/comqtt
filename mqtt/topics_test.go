@@ -329,6 +329,65 @@ func TestUnsubscribeShared(t *testing.T) {
 	require.Equal(t, 0, count)
 }
 
+func TestUnsubscribeNotSubscribed(t *testing.T) {
+	index := NewTopicsIndex()
+	index.Subscribe("cl1", packets.Subscription{Filter: "a/b"})
+	index.Subscribe("cl2", packets.Subscription{Filter: "a/b"})
+
+	ok, count := index.Unsubscribe("a/b", "cl3")
+	require.False(t, ok)
+	require.Equal(t, 2, count)
+
+	subs := index.root.particles.get("a").particles.get("b").subscriptions
+	_, exists := subs.Get("cl1")
+	require.True(t, exists)
+	_, exists = subs.Get("cl2")
+	require.True(t, exists)
+}
+
+func TestUnsubscribeSharedNotSubscribed(t *testing.T) {
+	index := NewTopicsIndex()
+	index.Subscribe("cl1", packets.Subscription{Filter: "$share/g/a/b"})
+	index.Subscribe("cl2", packets.Subscription{Filter: "$share/g/a/b"})
+
+	ok, _ := index.Unsubscribe("$share/g/a/b", "cl3")
+	require.False(t, ok)
+
+	final := index.root.particles.get("a").particles.get("b")
+	_, exists := final.shared.Get("g", "cl1")
+	require.True(t, exists)
+	_, exists = final.shared.Get("g", "cl2")
+	require.True(t, exists)
+}
+
+func TestUnsubscribeInlineOnly(t *testing.T) {
+	handler := func(cl *Client, sub packets.Subscription, pk packets.Packet) {}
+	index := NewTopicsIndex()
+	index.InlineSubscribe(InlineSubscription{Handler: handler, Subscription: packets.Subscription{Filter: "a/b", Identifier: 1}})
+
+	ok, _ := index.Unsubscribe("a/b", "cl1")
+	require.False(t, ok)
+
+	_, exists := index.root.particles.get("a").particles.get("b").inlineSubscriptions.Get(1)
+	require.True(t, exists)
+}
+
+func TestUnsubscribeKeepsParentInline(t *testing.T) {
+	handler := func(cl *Client, sub packets.Subscription, pk packets.Packet) {}
+	index := NewTopicsIndex()
+	index.InlineSubscribe(InlineSubscription{Handler: handler, Subscription: packets.Subscription{Filter: "a/b", Identifier: 1}})
+	index.Subscribe("cl1", packets.Subscription{Filter: "a/b/c"})
+
+	ok, _ := index.Unsubscribe("a/b/c", "cl1")
+	require.True(t, ok)
+
+	final := index.root.particles.get("a").particles.get("b")
+	require.NotNil(t, final)
+	require.Nil(t, final.particles.get("c"))
+	_, exists := final.inlineSubscriptions.Get(1)
+	require.True(t, exists)
+}
+
 func BenchmarkUnsubscribe(b *testing.B) {
 	index := NewTopicsIndex()
 
@@ -1081,4 +1140,20 @@ func TestInlineUnsubscribe(t *testing.T) {
 	ok, _ = index.InlineUnsubscribe(1, "not/exist")
 	require.Equal(t, 0, count)
 	require.False(t, ok)
+}
+
+func TestInlineUnsubscribeKeepsParentInline(t *testing.T) {
+	handler := func(cl *Client, sub packets.Subscription, pk packets.Packet) {}
+	index := NewTopicsIndex()
+	index.InlineSubscribe(InlineSubscription{Handler: handler, Subscription: packets.Subscription{Filter: "a/b", Identifier: 1}})
+	index.InlineSubscribe(InlineSubscription{Handler: handler, Subscription: packets.Subscription{Filter: "a/b/c", Identifier: 1}})
+
+	ok, _ := index.InlineUnsubscribe(1, "a/b/c")
+	require.True(t, ok)
+
+	final := index.root.particles.get("a").particles.get("b")
+	require.NotNil(t, final)
+	require.Nil(t, final.particles.get("c"))
+	_, exists := final.inlineSubscriptions.Get(1)
+	require.True(t, exists)
 }

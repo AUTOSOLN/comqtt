@@ -451,17 +451,20 @@ func (x *TopicsIndex) Unsubscribe(filter, client string) (bool, int) {
 		return false, count
 	}
 
+	var existed bool
 	if shareSub {
 		group, _ := isolateParticle(filter, 1)
+		_, existed = particle.shared.Get(group, client)
 		particle.shared.Delete(group, client)
 		count = particle.shared.Len()
 	} else {
+		_, existed = particle.subscriptions.Get(client)
 		particle.subscriptions.Delete(client)
 		count = particle.subscriptions.Len()
 	}
 
 	x.trim(particle)
-	return true, count
+	return existed, count
 }
 
 // RetainMessage saves a message payload to the end of a topic address. Returns
@@ -531,7 +534,7 @@ func (x *TopicsIndex) seek(filter string, d int) *particle {
 
 // trim removes empty filter particles from the index.
 func (x *TopicsIndex) trim(n *particle) {
-	for n.parent != nil && n.retainPath == "" && n.particles.len()+n.subscriptions.Len()+n.shared.Len() == 0 {
+	for n.parent != nil && n.retainPath == "" && n.particles.len()+n.subscriptions.Len()+n.shared.Len()+n.inlineSubscriptions.Len() == 0 {
 		key := n.key
 		n = n.parent
 		n.particles.delete(key)

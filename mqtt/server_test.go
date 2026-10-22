@@ -1620,24 +1620,27 @@ func TestServerProcessPublishACLCheckDeny(t *testing.T) {
 			cl.Properties.ProtocolVersion = tx.protocolVersion
 			s.Clients.Add(cl)
 
+			var pubErr error
 			wg := sync.WaitGroup{}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				err := s.processPublish(cl, tx.pk)
-				require.ErrorIs(t, err, tx.expectErr)
+				pubErr = s.processPublish(cl, tx.pk)
 				_ = w.Close()
 			}()
 
 			buf, err := io.ReadAll(r)
 			require.NoError(t, err)
 
+			// ReadAll returns once Stop closes the conn, before Closed() is set, so wait for processPublish.
+			wg.Wait()
+			require.ErrorIs(t, pubErr, tx.expectErr)
+
 			if tx.expectReponse != nil {
 				require.Equal(t, tx.expectReponse, buf)
 			}
 
 			require.Equal(t, tx.expectDisconnect, cl.Closed())
-			wg.Wait()
 		})
 	}
 }

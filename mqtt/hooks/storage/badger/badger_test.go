@@ -7,6 +7,7 @@ package badger
 import (
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -76,6 +77,7 @@ func TestID(t *testing.T) {
 
 func TestProvides(t *testing.T) {
 	h := new(Hook)
+	require.True(t, h.Provides(mqtt.OnSessionEstablish))
 	require.True(t, h.Provides(mqtt.OnSessionEstablished))
 	require.True(t, h.Provides(mqtt.OnDisconnect))
 	require.True(t, h.Provides(mqtt.OnSubscribed))
@@ -170,6 +172,66 @@ func TestOnClientExpired(t *testing.T) {
 	err = h.db.Get(clientKey, r)
 	require.Error(t, err)
 	require.ErrorIs(t, badgerhold.ErrNotFound, err)
+}
+
+func TestOnClientExpiredDeletesInflights(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	a := &mqtt.Client{ID: "a"}
+	h.OnSessionEstablished(a, packets.Packet{})
+	for i, cl := range []*mqtt.Client{a, a, {ID: "a:b"}, {ID: "zen"}} {
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+	}
+
+	h.OnClientExpired(a)
+
+	r, err := h.StoredInflightMessages()
+	require.NoError(t, err)
+	got := []string{}
+	for _, m := range r {
+		got = append(got, m.ClientID)
+	}
+	require.ElementsMatch(t, []string{"a:b", "zen"}, got)
+
+	err = h.db.Get(clientKey(a), new(storage.Client))
+	require.ErrorIs(t, err, badgerhold.ErrNotFound)
+}
+
+func TestOnSessionEstablishCleanDeletesInflights(t *testing.T) {
+	for _, tc := range []struct {
+		clean bool
+		want  []string
+	}{
+		{clean: true, want: []string{"a:b", "zen"}},
+		{clean: false, want: []string{"a", "a", "a:b", "zen"}},
+	} {
+		t.Run(strconv.FormatBool(tc.clean), func(t *testing.T) {
+			h := new(Hook)
+			h.SetOpts(logger, nil)
+			err := h.Init(nil)
+			require.NoError(t, err)
+			defer teardown(t, h.config.Path, h)
+
+			a := &mqtt.Client{ID: "a"}
+			for i, cl := range []*mqtt.Client{a, a, {ID: "a:b"}, {ID: "zen"}} {
+				h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+			}
+
+			h.OnSessionEstablish(a, packets.Packet{Connect: packets.ConnectParams{Clean: tc.clean}})
+
+			r, err := h.StoredInflightMessages()
+			require.NoError(t, err)
+			got := []string{}
+			for _, m := range r {
+				got = append(got, m.ClientID)
+			}
+			require.ElementsMatch(t, tc.want, got)
+		})
+	}
 }
 
 func TestOnClientExpiredNoDB(t *testing.T) {
@@ -861,6 +923,28 @@ func TestStoredInflightMessagesByCidNoMatch(t *testing.T) {
 	r, err := h.StoredInflightMessagesByCid("does-not-exist")
 	require.NoError(t, err)
 	require.Empty(t, r)
+}
+
+func TestStoredInflightMessagesByCidExactMatch(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	// the key prefix for "a" also matches "a:b"
+	h.OnQosPublish(&mqtt.Client{ID: "a"}, packets.Packet{PacketID: 1}, time.Now().Unix(), 0)
+	h.OnQosPublish(&mqtt.Client{ID: "a:b"}, packets.Packet{PacketID: 2}, time.Now().Unix(), 0)
+
+	for cid, want := range map[string]string{
+		"a":   storage.InflightKey + "_a:1",
+		"a:b": storage.InflightKey + "_a:b:2",
+	} {
+		r, err := h.StoredInflightMessagesByCid(cid)
+		require.NoError(t, err)
+		require.Len(t, r, 1, cid)
+		require.Equal(t, want, r[0].ID)
+	}
 }
 
 func TestStoredInflightMessagesByCidNoDB(t *testing.T) {

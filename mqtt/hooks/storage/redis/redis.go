@@ -217,6 +217,9 @@ func (h *Hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []by
 
 	var in *storage.Subscription
 	for i := 0; i < len(pk.Filters); i++ {
+		if reasonCodes[i] >= 0x80 { // refused filter; it was never subscribed or counted
+			continue
+		}
 		in = &storage.Subscription{
 			ID:     subscriptionKey(cl, pk.Filters[i].Filter),
 			T:      storage.SubscriptionKey,

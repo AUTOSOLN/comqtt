@@ -306,6 +306,25 @@ func TestOnSubscribedThenOnUnsubscribed(t *testing.T) {
 	require.ErrorIs(t, err, redis.Nil)
 }
 
+func TestOnSubscribedSkipsRefusedFilters(t *testing.T) {
+	m := miniredis.RunT(t)
+	defer m.Close()
+	s := newHook(t, m.Addr())
+	defer teardown(t, s)
+
+	pk := packets.Packet{Filters: packets.Subscriptions{
+		{Filter: "a/b/c"},
+		{Filter: "d/e/f"},
+	}}
+	s.OnSubscribed(client, pk, []byte{1, 0x87}, []int{1, 0})
+
+	key := s.hKey(utils.JoinStrings(storage.SubscriptionKey, client.ID))
+	_, err := s.db.HGet(s.ctx, key, "a/b/c").Result()
+	require.NoError(t, err)
+	_, err = s.db.HGet(s.ctx, key, "d/e/f").Result()
+	require.ErrorIs(t, err, redis.Nil)
+}
+
 func TestOnSubscribedNoDB(t *testing.T) {
 	m := miniredis.RunT(t)
 	defer m.Close()

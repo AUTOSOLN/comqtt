@@ -1182,7 +1182,9 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		// Synchronous write: used during shutdown so the packet reaches the TCP
 		// send buffer before the WriteLoop goroutine is stopped by CloseAll.
 		if err := cl.WritePacket(out); err != nil {
-			cl.State.Inflight.Delete(out.PacketID)
+			if ok := cl.State.Inflight.Delete(out.PacketID); ok {
+				atomic.AddInt64(&s.Info.Inflight, -1)
+			}
 			atomic.AddInt64(&s.Info.InflightDropped, 1)
 			cl.ops.hooks.OnQosDropped(cl, out)
 			cl.State.Inflight.IncreaseSendQuota()
@@ -1199,7 +1201,9 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		cl.ops.hooks.OnPublishDropped(cl, pk)
 
 		// packet was dropped due to irregular circumstances, so rollback inflight.
-		cl.State.Inflight.Delete(out.PacketID)
+		if ok := cl.State.Inflight.Delete(out.PacketID); ok {
+			atomic.AddInt64(&s.Info.Inflight, -1)
+		}
 		atomic.AddInt64(&s.Info.InflightDropped, 1)
 		cl.ops.hooks.OnQosDropped(cl, out)
 

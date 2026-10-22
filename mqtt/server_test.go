@@ -2089,6 +2089,62 @@ func TestPublishToClientExceedClientWritesPending(t *testing.T) {
 	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
 }
 
+func TestPublishToClientExceedClientWritesPendingInflightCount(t *testing.T) {
+	tt := []struct {
+		desc string
+		qos  byte
+	}{
+		{desc: "qos 1", qos: 1},
+		{desc: "qos 0", qos: 0},
+	}
+
+	for _, tx := range tt {
+		t.Run(tx.desc, func(t *testing.T) {
+			s := newServer()
+
+			_, w := net.Pipe()
+			cl := newClient(w, &ops{
+				info:  new(system.Info),
+				hooks: new(Hooks),
+				log:   logger,
+				options: &Options{
+					Capabilities: &Capabilities{
+						MaximumClientWritesPending: 3,
+						maximumPacketID:            10,
+					},
+				},
+			})
+
+			s.Clients.Add(cl)
+
+			for i := int32(0); i < cl.ops.options.Capabilities.MaximumClientWritesPending; i++ {
+				cl.State.outbound <- new(packets.Packet)
+				atomic.AddInt32(&cl.State.outboundQty, 1)
+			}
+
+			pk := packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: tx.qos}, TopicName: "a/b/c"}
+			_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: tx.qos}, pk, false)
+			require.ErrorIs(t, err, packets.ErrPendingClientWritesExceeded)
+			require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+			require.Equal(t, 0, cl.State.Inflight.Len())
+			require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
+		})
+	}
+}
+
+func TestPublishToClientDirectWriteFailureInflightCount(t *testing.T) {
+	s := newServer()
+	cl, r, _ := newTestClient()
+	_ = r.Close()
+	s.Clients.Add(cl)
+
+	pk := packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: 1}, TopicName: "a/b/c"}
+	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 1}, pk, true)
+	require.ErrorIs(t, err, io.ErrClosedPipe)
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
+}
+
 func TestPublishToClientServerTopicAlias(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()

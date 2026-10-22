@@ -272,6 +272,43 @@ func TestOnSessionEstablishClosedDB(t *testing.T) {
 	s.OnSessionEstablish(client, packets.Packet{})
 }
 
+func TestOnSessionEstablishCleanDiscardsPreviousSession(t *testing.T) {
+	for name, tc := range map[string]struct {
+		clean bool
+		left  int // subscriptions and inflights left for "a"
+	}{
+		"clean":      {clean: true, left: 0},
+		"persistent": {clean: false, left: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := miniredis.RunT(t)
+			defer m.Close()
+			s := newHook(t, m.Addr())
+			defer teardown(t, s)
+
+			// a's previous session lives on another node
+			a := seedSession(s, "a")
+			seedSession(s, "a:b")
+			require.NoError(t, s.db.HSet(s.ctx, s.hKey(ownerKey), "a", "c02").Err())
+
+			s.OnSessionEstablish(a, packets.Packet{Connect: packets.ConnectParams{Clean: tc.clean}})
+
+			owner, err := s.SessionOwner("a")
+			require.NoError(t, err)
+			require.Equal(t, "c01", owner)
+
+			subs, err := s.StoredSubscriptionsByCid("a")
+			require.NoError(t, err)
+			require.Len(t, subs, tc.left)
+			inflights, err := s.StoredInflightMessagesByCid("a")
+			require.NoError(t, err)
+			require.Len(t, inflights, tc.left)
+
+			requireStoredSession(t, s, "a:b", true)
+		})
+	}
+}
+
 func TestOnSessionEstablishedNoDB(t *testing.T) {
 	m := miniredis.RunT(t)
 	defer m.Close()

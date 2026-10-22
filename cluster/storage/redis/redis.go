@@ -172,16 +172,23 @@ func (s *Storage) Stop() error {
 }
 
 // OnSessionEstablish records this node as the session's owner before CONNACK, so
-// other nodes stop deleting its stored rows.
+// other nodes stop deleting its stored rows. On a clean start it also discards
+// the previous session's rows in the same transaction [MQTT-3.1.2-4].
 func (s *Storage) OnSessionEstablish(cl *mqtt.Client, pk packets.Packet) {
 	if s.db == nil {
 		s.Log.Error("", "error", storage.ErrDBFileNotOpen)
 		return
 	}
 
-	err := s.db.HSet(s.ctx, s.hKey(ownerKey), clientKey(cl), s.config.NodeName).Err()
+	_, err := s.db.TxPipelined(s.ctx, func(p redis.Pipeliner) error {
+		p.HSet(s.ctx, s.hKey(ownerKey), clientKey(cl), s.config.NodeName)
+		if pk.Connect.Clean {
+			p.Del(s.ctx, s.hKey(utils.JoinStrings(storage.SubscriptionKey, cl.ID)), s.hKey(utils.JoinStrings(storage.InflightKey, cl.ID)))
+		}
+		return nil
+	})
 	if err != nil {
-		s.Log.Error("failed to hset session owner", "error", err, "id", clientKey(cl))
+		s.Log.Error("failed to claim session", "error", err, "id", clientKey(cl))
 	}
 }
 

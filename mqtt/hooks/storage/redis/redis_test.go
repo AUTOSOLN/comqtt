@@ -786,6 +786,31 @@ func TestStoredInflightMessagesClosedDB(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestStoredInflightMessagesClientID(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	h := newHook(t, s.Addr())
+	defer teardown(t, h)
+
+	// "a:b" checks the client id is split at the last ':'; "i1" doesn't parse
+	for _, field := range []string{"zen:1", "a:b:2", "i1"} {
+		err := h.db.HSet(h.ctx, h.hKey(storage.InflightKey), field, &storage.Message{ID: field, T: storage.InflightKey}).Err()
+		require.NoError(t, err)
+	}
+
+	r, err := h.StoredInflightMessages()
+	require.NoError(t, err)
+	got := map[string]string{}
+	for _, m := range r {
+		got[m.ID] = m.ClientID
+	}
+	require.Equal(t, map[string]string{
+		"zen:1": "zen",
+		"a:b:2": "a:b",
+		"i1":    "",
+	}, got)
+}
+
 func TestStoredSysInfo(t *testing.T) {
 	s := miniredis.RunT(t)
 	defer s.Close()

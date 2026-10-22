@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/wind-c/comqtt/v2/mqtt"
 	"github.com/wind-c/comqtt/v2/mqtt/hooks/storage"
@@ -42,6 +43,16 @@ func retainedKey(topic string) string {
 // inflightKey returns a primary key for an inflight message.
 func inflightKey(cl *mqtt.Client, pk packets.Packet) string {
 	return cl.ID + ":" + pk.FormatID()
+}
+
+// inflightClientID returns the client id from an inflightKey key (everything before
+// the last ':', since packet ids are numeric), or "" if the key is malformed.
+func inflightClientID(key string) string {
+	i := strings.LastIndex(key, ":")
+	if i < 0 {
+		return ""
+	}
+	return key[:i]
 }
 
 // sysInfoKey returns a primary key for system info.
@@ -489,12 +500,13 @@ func (h *Hook) StoredInflightMessages() (v []storage.Message, err error) {
 		return
 	}
 
-	for _, row := range rows {
+	for k, row := range rows {
 		var d storage.Message
 		if err = d.UnmarshalBinary([]byte(row)); err != nil {
 			h.Log.Error("failed to unmarshal inflight message data", "error", err, "data", row)
 		}
 
+		d.ClientID = inflightClientID(k)
 		v = append(v, d)
 	}
 

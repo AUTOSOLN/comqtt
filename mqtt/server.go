@@ -1811,9 +1811,9 @@ func (s *Server) loadServerInfo(v system.Info) {
 		atomic.StoreInt64(&s.Info.PacketsSent, v.PacketsSent)
 		atomic.StoreInt64(&s.Info.InflightDropped, v.InflightDropped)
 	}
-	atomic.StoreInt64(&s.Info.Retained, v.Retained)
-	atomic.StoreInt64(&s.Info.Inflight, v.Inflight)
-	atomic.StoreInt64(&s.Info.Subscriptions, v.Subscriptions)
+	// Retained, Inflight and Subscriptions are deliberately not restored: the
+	// loaders count them from what was loaded, and the saved values are only as
+	// fresh as the last $SYS tick.
 }
 
 // loadSubscriptions restores subscriptions from the datastore.
@@ -1840,6 +1840,7 @@ func (s *Server) loadSubscriptions(v []storage.Subscription) {
 		// count represents the number of subscribers for the current filter
 		// isNew represents whether to subscribe for the first time
 		if isNew, count := s.Topics.Subscribe(sub.Client, sb); isNew {
+			atomic.AddInt64(&s.Info.Subscriptions, 1) // orphan rows (no stored client) are in the tree, so count them too
 			if cl, ok := s.Clients.Get(sub.Client); ok {
 				cl.State.Subscriptions.Add(sub.Filter, sb)
 				s.hooks.OnSubscribed(cl, packets.Packet{Filters: []packets.Subscription{sb}}, []byte{sub.Qos}, []int{count})
@@ -1932,6 +1933,7 @@ func (s *Server) loadSubscriptionsForClient(cl *Client, v []storage.Subscription
 			Identifier:        sub.Identifier,
 		}
 		if isNew, count := s.Topics.Subscribe(cl.ID, sb); isNew {
+			atomic.AddInt64(&s.Info.Subscriptions, 1)
 			cl.State.Subscriptions.Add(sub.Filter, sb)
 			s.hooks.OnSubscribed(cl, packets.Packet{Filters: []packets.Subscription{sb}}, []byte{sub.Qos}, []int{count})
 		}
@@ -1956,6 +1958,7 @@ func (s *Server) loadRetained(v []storage.Message) {
 	for _, msg := range v {
 		s.Topics.RetainMessage(msg.ToPacket())
 	}
+	atomic.StoreInt64(&s.Info.Retained, int64(s.Topics.Retained.Len()))
 }
 
 // clearExpiredClients deletes all clients which have been disconnected for longer

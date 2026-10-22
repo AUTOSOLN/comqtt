@@ -3471,6 +3471,85 @@ func TestServerClose(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Disconnect].Get(packets.TDisconnectShuttingDown).RawBytes, <-recv)
 }
 
+// closeCleanupHook records which disconnect cleanup calls reached the hooks
+// before Close returned.
+type closeCleanupHook struct {
+	HookBase
+	mu           sync.Mutex
+	subscribed   bool
+	disconnected bool
+	unsubscribed bool
+}
+
+func (h *closeCleanupHook) ID() string { return "close-cleanup" }
+
+func (h *closeCleanupHook) Provides(b byte) bool {
+	return b == OnSubscribed || b == OnDisconnect || b == OnUnsubscribed
+}
+
+func (h *closeCleanupHook) OnSubscribed(cl *Client, pk packets.Packet, reasonCodes []byte, counts []int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.subscribed = true
+}
+
+func (h *closeCleanupHook) OnDisconnect(cl *Client, err error, expire bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if expire {
+		h.disconnected = true
+	}
+}
+
+func (h *closeCleanupHook) OnUnsubscribed(cl *Client, pk packets.Packet, reasonCodes []byte, counts []int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, f := range pk.Filters {
+		if f.Filter == "a/b/c" {
+			h.unsubscribed = true
+		}
+	}
+}
+
+func TestServerCloseWaitsForClientCleanup(t *testing.T) {
+	s := newServer()
+	hook := new(closeCleanupHook)
+	err := s.AddHook(hook, nil)
+	require.NoError(t, err)
+
+	err = s.AddListener(listeners.NewMockListener("t1", ":1882"))
+	require.NoError(t, err)
+	_ = s.Serve()
+
+	r, w := net.Pipe()
+	go func() {
+		_ = s.EstablishConnection("t1", r)
+	}()
+
+	// drain server writes so the synchronous pipe never blocks them
+	go func() {
+		_, _ = io.Copy(io.Discard, w)
+	}()
+
+	_, _ = w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectClean).RawBytes)
+	_, _ = w.Write(packets.TPacketData[packets.Subscribe].Get(packets.TSubscribe).RawBytes)
+
+	require.Eventually(t, func() bool {
+		hook.mu.Lock()
+		defer hook.mu.Unlock()
+		return hook.subscribed
+	}, time.Second, time.Millisecond)
+
+	_ = s.Close()
+
+	hook.mu.Lock()
+	defer hook.mu.Unlock()
+	require.True(t, hook.disconnected)
+	require.True(t, hook.unsubscribed)
+	_, ok := s.Clients.Get("zen")
+	require.False(t, ok)
+}
+
 func TestServerClearExpiredInflights(t *testing.T) {
 	s := New(nil)
 	require.NotNil(t, s)

@@ -537,8 +537,14 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver)                                   // [MQTT-3.1.4-3]
 		if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
 			s.UnsubscribeClient(existing)
-			dropped := existing.ClearAllInflightsInMemoryOnly(true) // discarded with the old session
-			atomic.AddInt64(&s.Info.InflightDropped, int64(dropped))
+			if pk.Connect.Clean {
+				// the stores delete the rows in OnSessionEstablish
+				dropped := existing.ClearAllInflightsInMemoryOnly(true)
+				atomic.AddInt64(&s.Info.InflightDropped, int64(dropped))
+			} else {
+				// old v3 clean session: OnSessionEstablish can't see it, so drop through OnQosDropped
+				existing.ClearInflights(math.MaxInt64, 0)
+			}
 			atomic.StoreUint32(&existing.State.isTakenOver, 1) // only set isTakenOver after unsubscribe has occurred
 			return false                                       // [MQTT-3.2.2-3]
 		}

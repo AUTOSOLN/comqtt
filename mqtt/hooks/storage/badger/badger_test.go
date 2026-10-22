@@ -280,6 +280,26 @@ func TestOnSubscribedThenOnUnsubscribed(t *testing.T) {
 	require.Equal(t, badgerhold.ErrNotFound, err)
 }
 
+func TestOnSubscribedSkipsRefusedFilters(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	pk := packets.Packet{Filters: packets.Subscriptions{
+		{Filter: "a/b/c"},
+		{Filter: "d/e/f"},
+		{Filter: "g/h/i"},
+	}}
+	h.OnSubscribed(client, pk, []byte{1, 0x80, 0x87}, []int{1, 0, 0})
+
+	subs, err := h.StoredSubscriptions()
+	require.NoError(t, err)
+	require.Len(t, subs, 1)
+	require.Equal(t, "a/b/c", subs[0].Filter)
+}
+
 func TestOnSubscribedNoDB(t *testing.T) {
 	h := new(Hook)
 	h.SetOpts(logger, nil)

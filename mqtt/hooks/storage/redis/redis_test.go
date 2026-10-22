@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"testing"
 	"time"
 
@@ -94,6 +95,7 @@ func TestID(t *testing.T) {
 func TestProvides(t *testing.T) {
 	h := new(Hook)
 	h.SetOpts(logger, nil)
+	require.True(t, h.Provides(mqtt.OnSessionEstablish))
 	require.True(t, h.Provides(mqtt.OnSessionEstablished))
 	require.True(t, h.Provides(mqtt.OnDisconnect))
 	require.True(t, h.Provides(mqtt.OnSubscribed))
@@ -251,6 +253,56 @@ func TestOnClientExpired(t *testing.T) {
 	_, err = h.db.HGet(h.ctx, h.hKey(storage.ClientKey), clientKey).Result()
 	require.Error(t, err)
 	require.ErrorIs(t, redis.Nil, err)
+}
+
+func TestOnClientExpiredDeletesInflights(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	h := newHook(t, s.Addr())
+	defer teardown(t, h)
+
+	a := &mqtt.Client{ID: "a"}
+	h.OnSessionEstablished(a, packets.Packet{})
+	for i, cl := range []*mqtt.Client{a, a, {ID: "a:b"}, {ID: "zen"}} {
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+	}
+
+	h.OnClientExpired(a)
+
+	fields, err := h.db.HKeys(h.ctx, h.hKey(storage.InflightKey)).Result()
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"a:b:3", "zen:4"}, fields)
+
+	_, err = h.db.HGet(h.ctx, h.hKey(storage.ClientKey), clientKey(a)).Result()
+	require.ErrorIs(t, err, redis.Nil)
+}
+
+func TestOnSessionEstablishCleanDeletesInflights(t *testing.T) {
+	for _, tc := range []struct {
+		clean bool
+		want  []string
+	}{
+		{clean: true, want: []string{"a:b:3", "zen:4"}},
+		{clean: false, want: []string{"a:1", "a:2", "a:b:3", "zen:4"}},
+	} {
+		t.Run(strconv.FormatBool(tc.clean), func(t *testing.T) {
+			s := miniredis.RunT(t)
+			defer s.Close()
+			h := newHook(t, s.Addr())
+			defer teardown(t, h)
+
+			a := &mqtt.Client{ID: "a"}
+			for i, cl := range []*mqtt.Client{a, a, {ID: "a:b"}, {ID: "zen"}} {
+				h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+			}
+
+			h.OnSessionEstablish(a, packets.Packet{Connect: packets.ConnectParams{Clean: tc.clean}})
+
+			fields, err := h.db.HKeys(h.ctx, h.hKey(storage.InflightKey)).Result()
+			require.NoError(t, err)
+			require.ElementsMatch(t, tc.want, fields)
+		})
+	}
 }
 
 func TestOnClientExpiredClosedDB(t *testing.T) {

@@ -82,6 +82,7 @@ func (h *Hook) ID() string {
 // Provides indicates which hook methods this hook provides.
 func (h *Hook) Provides(b byte) bool {
 	return bytes.Contains([]byte{
+		mqtt.OnSessionEstablish,
 		mqtt.OnSessionEstablished,
 		mqtt.OnDisconnect,
 		mqtt.OnSubscribed,
@@ -150,6 +151,18 @@ func (h *Hook) Stop() error {
 	h.Log.Info("disconnecting from redis service")
 
 	return h.db.Close()
+}
+
+// OnSessionEstablish deletes the previous session's inflight messages on a clean start [MQTT-3.1.2-4].
+func (h *Hook) OnSessionEstablish(cl *mqtt.Client, pk packets.Packet) {
+	if h.db == nil {
+		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+		return
+	}
+
+	if pk.Connect.Clean {
+		h.deleteInflights(cl.ID)
+	}
 }
 
 // OnSessionEstablished adds a client to the store when their session is established.
@@ -399,7 +412,7 @@ func (h *Hook) OnRetainedExpired(filter string) {
 	}
 }
 
-// OnClientExpired deleted expired clients from the store.
+// OnClientExpired deletes expired clients and their inflight messages from the store.
 func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	if h.db == nil {
 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
@@ -409,6 +422,33 @@ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	err := h.db.HDel(h.ctx, h.hKey(storage.ClientKey), clientKey(cl)).Err()
 	if err != nil {
 		h.Log.Error("failed to delete expired client", "error", err, "id", clientKey(cl))
+	}
+
+	h.deleteInflights(cl.ID)
+}
+
+// deleteInflights deletes every stored inflight message for the client id.
+func (h *Hook) deleteInflights(cid string) {
+	// reads every inflight field name per call; HSCAN if the inflight hash
+	// gets large.
+	fields, err := h.db.HKeys(h.ctx, h.hKey(storage.InflightKey)).Result()
+	if err != nil {
+		h.Log.Error("failed to read client inflight keys", "error", err, "id", cid)
+		return
+	}
+
+	var matched []string
+	for _, f := range fields {
+		if inflightClientID(f) == cid { // exact match: "a:" is also a prefix of "a:b"'s fields
+			matched = append(matched, f)
+		}
+	}
+	if len(matched) == 0 {
+		return
+	}
+
+	if err = h.db.HDel(h.ctx, h.hKey(storage.InflightKey), matched...).Err(); err != nil {
+		h.Log.Error("failed to delete client inflight data", "error", err, "id", cid)
 	}
 }
 

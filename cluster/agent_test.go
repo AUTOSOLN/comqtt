@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"errors"
 	"io"
 	"net"
 	"strconv"
@@ -186,4 +187,42 @@ func TestProcessRelayMsgConnectRemovesClient(t *testing.T) {
 	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
 	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.InflightDropped))
 	require.Equal(t, int32(0), hook.calls.Load())
+}
+
+// fakeOwner answers SessionOwner with a fixed result.
+type fakeOwner struct {
+	owner string
+	err   error
+}
+
+func (f fakeOwner) SessionOwner(string) (string, error) { return f.owner, f.err }
+
+func TestProcessRelayMsgConnectChecksOwner(t *testing.T) {
+	log.Init(log.DefaultOptions())
+
+	for name, tc := range map[string]struct {
+		owners SessionOwner
+		kept   bool
+	}{
+		"owned here":    {owners: fakeOwner{owner: "c01"}, kept: true},
+		"owned by peer": {owners: fakeOwner{owner: "c02"}},
+		"no owner":      {owners: fakeOwner{}},
+		"lookup failed": {owners: fakeOwner{err: errors.New("redis down")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := mqtt.New(nil)
+			a := &Agent{mqttServer: s, Config: &config.Cluster{NodeName: "c01"}}
+			a.SetSessionOwner(tc.owners)
+
+			r, w := net.Pipe()
+			t.Cleanup(func() { _ = w.Close() })
+			go func() { _, _ = io.Copy(io.Discard, w) }()
+			s.Clients.Add(s.NewClient(r, "t1", "zen", false))
+
+			a.processRelayMsg(&message.Message{Type: packets.Connect, ClientID: "zen", NodeID: "c02"})
+
+			_, ok := s.Clients.Get("zen")
+			require.Equal(t, tc.kept, ok)
+		})
+	}
 }

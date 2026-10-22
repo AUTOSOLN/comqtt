@@ -56,6 +56,12 @@ type Agent struct {
 	raftNotifyCh      chan *message.Message
 	inboundMsgCh      chan []byte
 	grpcMsgCh         chan *message.Message
+	owners            SessionOwner // session owner lookup for takeover notices; nil skips the check
+}
+
+// SessionOwner looks up which node owns a client's session.
+type SessionOwner interface {
+	SessionOwner(cid string) (string, error)
 }
 
 func NewAgent(conf *config.Cluster) *Agent {
@@ -186,6 +192,26 @@ func (a *Agent) BindMqttServer(server *mqtt.Server) {
 
 func (a *Agent) GetLocalName() string {
 	return a.Config.NodeName
+}
+
+// SetSessionOwner sets the lookup used to ignore takeover notices for sessions this node owns.
+func (a *Agent) SetSessionOwner(o SessionOwner) {
+	a.owners = o
+}
+
+// ownsSession reports whether the session store records this node as the client's owner.
+func (a *Agent) ownsSession(cid string) bool {
+	if a.owners == nil {
+		return false
+	}
+
+	owner, err := a.owners.SessionOwner(cid)
+	if err != nil {
+		log.Warn("session owner lookup failed", "client", cid, "error", err)
+		return false
+	}
+
+	return owner == a.GetLocalName()
 }
 
 func (a *Agent) getNodeMember(nodeId string) *discovery.Member {
@@ -344,9 +370,14 @@ func (a *Agent) processRelayMsg(msg *message.Message) {
 			OnPublishPacketLog(DirectionInbound, msg.NodeID, msg.ClientID, pk.TopicName, pk.PacketID)
 		}
 	case packets.Connect:
-		// another node took over this client's session: remove the local copy
+		// another node took over this client's session: remove the local copy,
+		// unless the client reconnected here after the notice was sent
 		if existing, ok := a.mqttServer.Clients.Get(msg.ClientID); ok {
-			a.mqttServer.RemoveTakenOverClient(existing)
+			if a.ownsSession(msg.ClientID) {
+				log.Info("ignoring takeover notice, session owned by this node", "client", msg.ClientID, "from", msg.NodeID)
+			} else {
+				a.mqttServer.RemoveTakenOverClient(existing)
+			}
 		}
 		OnConnectPacketLog(DirectionInbound, msg.NodeID, msg.ClientID)
 	}

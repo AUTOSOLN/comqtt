@@ -110,7 +110,7 @@ func realMain(ctx context.Context) error {
 	cfg.Mqtt.Options.Logger = log.Default()
 	server := mqtt.New(&cfg.Mqtt.Options)
 	log.Info("comqtt server initializing...")
-	initStorage(server, cfg)
+	store := initStorage(server, cfg)
 	initAuth(server, cfg)
 	initBridge(server, cfg)
 
@@ -118,7 +118,7 @@ func realMain(ctx context.Context) error {
 	if cfg.Cluster.Members == nil {
 		onError(config.ErrClusterOpts, "members parameter etc")
 	} else {
-		initClusterNode(server, cfg)
+		initClusterNode(server, cfg, store)
 	}
 
 	// gen tls config
@@ -205,12 +205,13 @@ func initAuth(server *mqtt.Server, conf *config.Config) {
 	}
 }
 
-func initStorage(server *mqtt.Server, conf *config.Config) {
+func initStorage(server *mqtt.Server, conf *config.Config) *coredis.Storage {
 	logMsg := "init storage"
 	if conf.StorageWay != config.StorageWayRedis {
 		onError(config.ErrStorageWay, logMsg)
 	}
-	err := server.AddHook(new(coredis.Storage), &coredis.Options{
+	store := new(coredis.Storage)
+	err := server.AddHook(store, &coredis.Options{
 		HPrefix:  conf.Redis.HPrefix,
 		NodeName: conf.Cluster.NodeName,
 		Options: &redis.Options{
@@ -221,6 +222,7 @@ func initStorage(server *mqtt.Server, conf *config.Config) {
 		},
 	})
 	onError(err, logMsg)
+	return store
 }
 
 func initBridge(server *mqtt.Server, conf *config.Config) {
@@ -234,10 +236,11 @@ func initBridge(server *mqtt.Server, conf *config.Config) {
 	}
 }
 
-func initClusterNode(server *mqtt.Server, conf *config.Config) {
+func initClusterNode(server *mqtt.Server, conf *config.Config, owners cs.SessionOwner) {
 	//setup member node
 	agent = cs.NewAgent(&conf.Cluster)
 	agent.BindMqttServer(server)
+	agent.SetSessionOwner(owners)
 	onError(agent.Start(), "create node and join cluster")
 	log.Info("cluster node created")
 }

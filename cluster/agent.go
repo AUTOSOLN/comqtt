@@ -344,13 +344,9 @@ func (a *Agent) processRelayMsg(msg *message.Message) {
 			OnPublishPacketLog(DirectionInbound, msg.NodeID, msg.ClientID, pk.TopicName, pk.PacketID)
 		}
 	case packets.Connect:
-		//If a client is connected to another node, the client's data cached on the node needs to be cleared
+		// another node took over this client's session: remove the local copy
 		if existing, ok := a.mqttServer.Clients.Get(msg.ClientID); ok {
-			// connection notify from other node
-			existing.Stop(packets.ErrSessionTakenOver)
-			// clean local session and subscriptions
-			a.mqttServer.UnsubscribeClient(existing)
-			a.mqttServer.Clients.Delete(msg.ClientID)
+			a.mqttServer.RemoveTakenOverClient(existing)
 		}
 		OnConnectPacketLog(DirectionInbound, msg.NodeID, msg.ClientID)
 	}

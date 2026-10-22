@@ -1191,6 +1191,39 @@ func TestInheritClientSessionV3CleanCopyDropsInflights(t *testing.T) {
 	requireInfoCounts(t, s)
 }
 
+func TestRemoveTakenOverClient(t *testing.T) {
+	s := newServer()
+	hook := new(qosDroppedHook)
+	require.NoError(t, s.AddHook(hook, nil))
+
+	r, w := net.Pipe()
+	t.Cleanup(func() { _ = w.Close() })
+	go func() { _, _ = io.Copy(io.Discard, w) }() // so the DISCONNECT write doesn't block
+
+	cl := s.NewClient(r, "t1", "zen", false)
+	for _, filter := range []string{"a/b", "c/d"} {
+		sub := packets.Subscription{Filter: filter, Qos: 1}
+		s.Topics.Subscribe(cl.ID, sub)
+		cl.State.Subscriptions.Add(sub.Filter, sub)
+		atomic.AddInt64(&s.Info.Subscriptions, 1)
+	}
+	addSentInflights(s, cl)
+	s.Clients.Add(cl)
+	requireInfoCounts(t, s)
+
+	s.RemoveTakenOverClient(cl)
+
+	_, ok := s.Clients.Get("zen")
+	require.False(t, ok)
+	require.Equal(t, 0, s.Topics.SubscriptionCount())
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Subscriptions))
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.InflightDropped))
+	require.Equal(t, int32(0), hook.dropped.Load())
+	require.ErrorIs(t, cl.StopCause(), packets.ErrSessionTakenOver)
+	requireInfoCounts(t, s)
+}
+
 // byCidHistoryHook answers StoredSubscriptionsByCid/StoredInflightMessagesByCid
 // with canned data for one client id, standing in for cluster.Hook's real
 // cross-node pull in these tests.

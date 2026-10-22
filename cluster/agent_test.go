@@ -1,14 +1,20 @@
 package cluster
 
 import (
+	"io"
+	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	"github.com/wind-c/comqtt/v2/cluster/log"
+	"github.com/wind-c/comqtt/v2/cluster/message"
 	"github.com/wind-c/comqtt/v2/cluster/utils"
 	"github.com/wind-c/comqtt/v2/config"
+	"github.com/wind-c/comqtt/v2/mqtt"
+	"github.com/wind-c/comqtt/v2/mqtt/packets"
 )
 
 func TestCluster(t *testing.T) {
@@ -137,4 +143,47 @@ func TestCluster(t *testing.T) {
 	require.NotEqual(t, leaderAfterRestart1, "node1", "After restart, node1 should not be the leader")
 
 	t.Log("Test completed successfully")
+}
+
+// storedInflightHook counts the hook calls that would delete stored inflight rows.
+type storedInflightHook struct {
+	mqtt.HookBase
+	calls atomic.Int32
+}
+
+func (h *storedInflightHook) ID() string { return "stored-inflight" }
+
+func (h *storedInflightHook) Provides(b byte) bool {
+	return b == mqtt.OnQosDropped || b == mqtt.OnQosComplete
+}
+
+func (h *storedInflightHook) OnQosDropped(cl *mqtt.Client, pk packets.Packet)  { h.calls.Add(1) }
+func (h *storedInflightHook) OnQosComplete(cl *mqtt.Client, pk packets.Packet) { h.calls.Add(1) }
+
+func TestProcessRelayMsgConnectRemovesClient(t *testing.T) {
+	log.Init(log.DefaultOptions())
+
+	s := mqtt.New(nil)
+	hook := new(storedInflightHook)
+	require.NoError(t, s.AddHook(hook, nil))
+	a := &Agent{mqttServer: s}
+
+	r, w := net.Pipe()
+	t.Cleanup(func() { _ = w.Close() })
+	go func() { _, _ = io.Copy(io.Discard, w) }()
+	cl := s.NewClient(r, "t1", "zen", false)
+	for id := uint16(1); id <= 2; id++ {
+		cl.State.Inflight.Set(packets.Packet{PacketID: id, Created: time.Now().Unix()})
+		atomic.AddInt64(&s.Info.Inflight, 1)
+	}
+	s.Clients.Add(cl)
+
+	a.processRelayMsg(&message.Message{Type: packets.Connect, ClientID: "zen", NodeID: "other"})
+
+	_, ok := s.Clients.Get("zen")
+	require.False(t, ok)
+	require.Equal(t, 0, cl.State.Inflight.Len())
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.InflightDropped))
+	require.Equal(t, int32(0), hook.calls.Load())
 }

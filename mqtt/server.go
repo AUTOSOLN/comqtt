@@ -529,6 +529,17 @@ func (s *Server) validateConnect(cl *Client, pk packets.Packet) packets.Code {
 	return code
 }
 
+// RemoveTakenOverClient removes the local copy of a session that another cluster
+// node has taken over. The stored rows now belong to that node, so no hook deletes
+// them, and the inflights are not counted as dropped.
+func (s *Server) RemoveTakenOverClient(cl *Client) {
+	s.UnsubscribeClient(cl)
+	cl.ClearAllInflightsInMemoryOnly(true)       // moved to the other node, not dropped
+	atomic.StoreUint32(&cl.State.isTakenOver, 1) // after unsubscribe; stops the disconnect path's cleanup
+	s.Clients.Delete(cl.ID)
+	_ = s.DisconnectClient(cl, packets.ErrSessionTakenOver) // [MQTT-3.1.4-3]
+}
+
 // inheritClientSession inherits the state of an existing client sharing the same
 // connection ID. If clean is true, the state of any previously existing client
 // session is abandoned.

@@ -47,6 +47,10 @@ const (
 	// there's no concurrency concern in setting it — cl is never shared
 	// across connections.
 	ExtAuthDenyCode = "mqtt.auth-deny-code"
+
+	// closeWaitTimeout bounds how long Close waits for client cleanup. Cleanup takes
+	// milliseconds per client; 3s stays well inside Docker's default 10s stop grace period.
+	closeWaitTimeout = 3 * time.Second
 )
 
 var (
@@ -146,6 +150,9 @@ type Server struct {
 	Blacklist      []string             // blacklist of client id
 	TopicToStats   map[string]int64     // $SYS topic to statistics lookup
 	TopicToStatsMu sync.Mutex
+	connMu         sync.Mutex     // guards closing and connWg.Add
+	closing        bool           // set by Close; no new connections are admitted
+	connWg         sync.WaitGroup // tracks connection handlers so Close can wait for their cleanup
 }
 
 // loop contains interval tickers for the system events loop.
@@ -352,6 +359,16 @@ func (s *Server) eventLoop() {
 
 // EstablishConnection establishes a new client when a listener accepts a new connection.
 func (s *Server) EstablishConnection(listener string, c net.Conn) error {
+	s.connMu.Lock()
+	if s.closing {
+		s.connMu.Unlock()
+		_ = c.Close()
+		return packets.ErrServerShuttingDown
+	}
+	s.connWg.Add(1)
+	s.connMu.Unlock()
+	defer s.connWg.Done()
+
 	cl := s.NewClient(c, listener, "", false)
 	return s.attachClient(cl, listener)
 }
@@ -1646,7 +1663,23 @@ func (s *Server) Close() error {
 		s.sendLWT(cl)
 	}
 
+	s.connMu.Lock()
+	s.closing = true
+	s.connMu.Unlock()
+
 	s.Listeners.CloseAll(s.closeListenerClients)
+
+	waited := make(chan struct{})
+	go func() {
+		s.connWg.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(closeWaitTimeout):
+		s.Log.Warn("timed out waiting for client cleanup", "waited", closeWaitTimeout)
+	}
+
 	s.hooks.OnStopped()
 	s.hooks.Stop()
 

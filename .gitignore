@@ -1,6 +1,7 @@
 bolt.db
 /dump.rdb
 raft.db
+comqtt.db
 .idea
 .vscode
 

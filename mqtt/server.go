@@ -537,7 +537,8 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver)                                   // [MQTT-3.1.4-3]
 		if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
 			s.UnsubscribeClient(existing)
-			existing.ClearAllInflightsInMemoryOnly(true)
+			dropped := existing.ClearAllInflightsInMemoryOnly(true) // discarded with the old session
+			atomic.AddInt64(&s.Info.InflightDropped, int64(dropped))
 			atomic.StoreUint32(&existing.State.isTakenOver, 1) // only set isTakenOver after unsubscribe has occurred
 			return false                                       // [MQTT-3.2.2-3]
 		}
@@ -1977,6 +1978,11 @@ func (s *Server) clearExpiredClients(dt int64) {
 
 		if disconnected+int64(expire) < dt {
 			s.hooks.OnClientExpired(client)
+			// No OnQosDropped: each store's OnClientExpired deletes the rows, so it
+			// would only repeat those deletes. Counted as dropped, like the
+			// zero-expiry path's ClearInflights in the disconnect handler.
+			dropped := client.ClearAllInflightsInMemoryOnly(true)
+			atomic.AddInt64(&s.Info.InflightDropped, int64(dropped))
 			s.UnsubscribeClient(client) // [MQTT-4.1.0-2] clean up topic subscriptions on session expiry
 			s.Clients.Delete(id)        // [MQTT-4.1.0-2]
 		}

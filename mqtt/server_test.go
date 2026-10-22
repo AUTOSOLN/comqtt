@@ -1076,6 +1076,72 @@ func TestInheritClientSession(t *testing.T) {
 	require.Equal(t, 0, cl.State.Subscriptions.Len())
 }
 
+// newInflightTakeoverClient returns a persistent v5 client sharing s.Info, with
+// Conn cleared so DisconnectClient doesn't block writing to the pipe.
+func newInflightTakeoverClient(s *Server) *Client {
+	cl, _, _ := newTestClient()
+	cl.Net.Conn = nil
+	cl.ops.info = s.Info
+	cl.Properties.ProtocolVersion = 5
+	return cl
+}
+
+// addSentInflights gives cl outbound inflights 1-3 and counts them in s.Info, as
+// publishToClient does.
+func addSentInflights(s *Server, cl *Client) {
+	for id := uint16(1); id <= 3; id++ {
+		cl.State.Inflight.Set(packets.Packet{PacketID: id, Created: time.Now().Unix()})
+		atomic.AddInt64(&s.Info.Inflight, 1)
+	}
+}
+
+func TestInheritClientSessionKeepsInflightCount(t *testing.T) {
+	s := newServer()
+	existing := newInflightTakeoverClient(s)
+	addSentInflights(s, existing)
+	s.Clients.Add(existing)
+
+	cl := newInflightTakeoverClient(s)
+	require.True(t, s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "mochi"}}, cl))
+	require.Equal(t, int64(3), atomic.LoadInt64(&s.Info.Inflight))
+
+	for id := uint16(1); id <= 3; id++ {
+		require.NoError(t, s.processPuback(cl, packets.Packet{PacketID: id}))
+	}
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+}
+
+func TestInheritClientSessionRepeatedTakeovers(t *testing.T) {
+	s := newServer()
+	cl := newInflightTakeoverClient(s)
+	addSentInflights(s, cl)
+	s.Clients.Add(cl)
+
+	for range 3 {
+		next := newInflightTakeoverClient(s)
+		require.True(t, s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "mochi"}}, next))
+		require.Equal(t, int64(3), atomic.LoadInt64(&s.Info.Inflight))
+		s.Clients.Add(next) // as attachClient does
+		cl = next
+	}
+
+	for id := uint16(1); id <= 3; id++ {
+		require.NoError(t, s.processPuback(cl, packets.Packet{PacketID: id}))
+	}
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+}
+
+func TestInheritClientSessionCleanDropsInflightCount(t *testing.T) {
+	s := newServer()
+	existing := newInflightTakeoverClient(s)
+	addSentInflights(s, existing)
+	s.Clients.Add(existing)
+
+	cl := newInflightTakeoverClient(s)
+	require.False(t, s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "mochi", Clean: true}}, cl))
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+}
+
 // byCidHistoryHook answers StoredSubscriptionsByCid/StoredInflightMessagesByCid
 // with canned data for one client id, standing in for cluster.Hook's real
 // cross-node pull in these tests.

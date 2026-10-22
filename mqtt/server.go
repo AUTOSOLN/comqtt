@@ -537,7 +537,7 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver)                                   // [MQTT-3.1.4-3]
 		if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
 			s.UnsubscribeClient(existing)
-			existing.ClearAllInflightsInMemoryOnly()
+			existing.ClearAllInflightsInMemoryOnly(true)
 			atomic.StoreUint32(&existing.State.isTakenOver, 1) // only set isTakenOver after unsubscribe has occurred
 			return false                                       // [MQTT-3.2.2-3]
 		}
@@ -568,7 +568,7 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		// Clean the state of the existing client to prevent sequential take-overs
 		// from increasing memory usage by inflights + subs * client-id.
 		s.UnsubscribeClient(existing)
-		existing.ClearAllInflightsInMemoryOnly()
+		existing.ClearAllInflightsInMemoryOnly(false) // messages moved to cl and are still counted
 
 		s.Log.Debug("session taken over", "client", cl.ID, "old_remote", existing.Net.Remote, "new_remote", cl.Net.Remote)
 

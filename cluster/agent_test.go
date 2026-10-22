@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/panjf2000/ants/v2"
 	"github.com/stretchr/testify/require"
+	"github.com/wind-c/comqtt/v2/cluster/discovery"
 	"github.com/wind-c/comqtt/v2/cluster/log"
 	"github.com/wind-c/comqtt/v2/cluster/message"
 	"github.com/wind-c/comqtt/v2/cluster/utils"
@@ -223,6 +225,47 @@ func TestProcessRelayMsgConnectChecksOwner(t *testing.T) {
 
 			_, ok := s.Clients.Get("zen")
 			require.Equal(t, tc.kept, ok)
+		})
+	}
+}
+
+// sentNode records SendToOthers; the embedded nil Node panics on anything else.
+type sentNode struct {
+	discovery.Node
+	sent chan []byte
+}
+
+func (n *sentNode) SendToOthers(msg []byte) { n.sent <- msg }
+
+func TestMqttEventHookNotifiesEverySession(t *testing.T) {
+	log.Init(log.DefaultOptions())
+
+	for name, cl := range map[string]*mqtt.Client{
+		"new":    {ID: "zen", InheritWay: mqtt.InheritWayNew},
+		"local":  {ID: "zen", InheritWay: mqtt.InheritWayLocal},
+		"remote": {ID: "zen", InheritWay: mqtt.InheritWayRemote},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pool, err := ants.NewPool(1)
+			require.NoError(t, err)
+			defer pool.Release()
+
+			node := &sentNode{sent: make(chan []byte, 1)}
+			a := &Agent{Config: &config.Cluster{NodeName: "c01"}, OutPool: pool, membership: node}
+			h := &MqttEventHook{agent: a}
+
+			h.OnSessionEstablished(cl, packets.Packet{Connect: packets.ConnectParams{Clean: true}})
+
+			select {
+			case b := <-node.sent:
+				var m message.Message
+				require.NoError(t, m.MsgpackLoad(b))
+				require.Equal(t, packets.Connect, m.Type)
+				require.Equal(t, "zen", m.ClientID)
+				require.Equal(t, "c01", m.NodeID)
+			case <-time.After(time.Second):
+				t.Fatal("no takeover notice sent")
+			}
 		})
 	}
 }

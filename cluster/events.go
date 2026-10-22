@@ -49,11 +49,9 @@ func (h *MqttEventHook) Init(config any) error {
 	return nil
 }
 
-// OnSessionEstablished notifies other nodes to perform local subscription cleanup when their session is established.
+// OnSessionEstablished notifies the other nodes that this node now holds the
+// client's session, so they remove any local copy [MQTT-3.1.4-3].
 func (h *MqttEventHook) OnSessionEstablished(cl *mqtt.Client, pk packets.Packet) {
-	if cl.InheritWay != mqtt.InheritWayRemote {
-		return
-	}
 	if pk.Connect.ClientIdentifier == "" && cl != nil {
 		pk.Connect.ClientIdentifier = cl.ID
 	}

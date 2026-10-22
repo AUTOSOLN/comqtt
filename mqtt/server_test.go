@@ -482,6 +482,7 @@ func TestEstablishConnectionInheritExisting(t *testing.T) {
 	cl.ID = packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt311).Packet.Connect.ClientIdentifier
 	cl.State.Subscriptions.Add("a/b/c", packets.Subscription{Filter: "a/b/c", Qos: 1})
 	cl.State.Inflight.Set(*packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet)
+	atomic.AddInt64(&s.Info.Inflight, 1)
 	s.Clients.Add(cl)
 
 	r, w := net.Pipe()
@@ -538,6 +539,7 @@ func TestEstablishConnectionInheritExisting(t *testing.T) {
 
 	// Prevent sequential takeover memory-bloom.
 	require.Empty(t, cl.State.Subscriptions.GetAll())
+	requireInfoCounts(t, s)
 }
 
 // See https://github.com/mochi-mqtt/server/issues/173
@@ -3416,6 +3418,73 @@ func TestServerReadStore(t *testing.T) {
 	require.Error(t, err)
 }
 
+// storedStateHook returns fixed stored state for readStore, with a $SYS
+// snapshot whose counters are deliberately wrong.
+type storedStateHook struct {
+	HookBase
+}
+
+func (h *storedStateHook) ID() string { return "stored-state" }
+
+func (h *storedStateHook) Provides(b byte) bool {
+	return bytes.Contains([]byte{StoredClients, StoredSubscriptions, StoredInflightMessages, StoredRetainedMessages, StoredSysInfo}, []byte{b})
+}
+
+func (h *storedStateHook) StoredClients() ([]storage.Client, error) {
+	return []storage.Client{{ID: "mochi"}, {ID: "zen"}}, nil
+}
+
+func (h *storedStateHook) StoredSubscriptions() ([]storage.Subscription, error) {
+	return []storage.Subscription{
+		{ID: "sub1", Client: "mochi", Filter: "a/b/c", Qos: 1},
+		{ID: "sub2", Client: "zen", Filter: "a/b/c", Qos: 1},
+		{ID: "sub3", Client: "zen", Filter: "d/e/f"},
+		{ID: "sub4", Client: "ghost", Filter: "g/h/i"}, // orphan: no stored client
+	}, nil
+}
+
+func (h *storedStateHook) StoredInflightMessages() ([]storage.Message, error) {
+	return []storage.Message{
+		{ClientID: "mochi", PacketID: 1, TopicName: "a/b/c"},
+		{ClientID: "zen", PacketID: 2, TopicName: "a/b/c"},
+		{ClientID: "ghost", PacketID: 3, TopicName: "g/h/i"}, // skipped: unknown client
+	}, nil
+}
+
+func (h *storedStateHook) StoredRetainedMessages() ([]storage.Message, error) {
+	return []storage.Message{
+		{FixedHeader: packets.FixedHeader{Retain: true}, Payload: []byte("a"), TopicName: "a/b/c"},
+		{FixedHeader: packets.FixedHeader{Retain: true}, Payload: []byte("d"), TopicName: "d/e/f"},
+	}, nil
+}
+
+func (h *storedStateHook) StoredSysInfo() (storage.SystemInfo, error) {
+	return storage.SystemInfo{Info: system.Info{Version: "2.0.0", Subscriptions: 999, Inflight: 999, Retained: 999, BytesReceived: 60}}, nil
+}
+
+func TestServerReadStoreCountsLoadedState(t *testing.T) {
+	for _, restore := range []bool{true, false} {
+		t.Run("restore "+strconv.FormatBool(restore), func(t *testing.T) {
+			s := newServer()
+			s.Options.Capabilities.Compatibilities.RestoreSysInfoOnRestart = restore
+			require.NoError(t, s.AddHook(new(storedStateHook), nil))
+
+			require.NoError(t, s.readStore())
+			require.Equal(t, int64(4), atomic.LoadInt64(&s.Info.Subscriptions))
+			require.Equal(t, int64(2), atomic.LoadInt64(&s.Info.Inflight))
+			require.Equal(t, int64(2), atomic.LoadInt64(&s.Info.Retained))
+			requireInfoCounts(t, s)
+
+			// gated statistics are still restored only when asked
+			want := int64(0)
+			if restore {
+				want = 60
+			}
+			require.Equal(t, want, atomic.LoadInt64(&s.Info.BytesReceived))
+		})
+	}
+}
+
 func TestServerLoadClients(t *testing.T) {
 	v := []storage.Client{
 		{ID: "mochi"},
@@ -3445,6 +3514,24 @@ func TestServerLoadSubscriptions(t *testing.T) {
 	require.Equal(t, 0, cl.State.Subscriptions.Len())
 	s.loadSubscriptions(v)
 	require.Equal(t, 3, cl.State.Subscriptions.Len())
+	require.Equal(t, int64(3), atomic.LoadInt64(&s.Info.Subscriptions))
+	requireInfoCounts(t, s)
+}
+
+func TestServerLoadSubscriptionsCountsOrphans(t *testing.T) {
+	s := newServer()
+	cl, _, _ := newTestClient()
+	s.Clients.Add(cl)
+
+	s.loadSubscriptions([]storage.Subscription{
+		{ID: "sub1", Client: "mochi", Filter: "a/b/c"},
+		{ID: "sub2", Client: "ghost", Filter: "a/b/c"}, // no stored client
+	})
+
+	require.Equal(t, 1, cl.State.Subscriptions.Len())
+	require.Contains(t, s.Topics.Subscribers("a/b/c").Subscriptions, "ghost")
+	require.Equal(t, int64(2), atomic.LoadInt64(&s.Info.Subscriptions))
+	requireInfoCounts(t, s)
 }
 
 func TestServerLoadSubscriptionsSkipsRefused(t *testing.T) {
@@ -3484,6 +3571,21 @@ func TestServerLoadSubscriptionsForClientSkipsRefused(t *testing.T) {
 	require.False(t, ok)
 	require.Contains(t, s.Topics.Subscribers("a/b/c").Subscriptions, "mochi")
 	require.NotContains(t, s.Topics.Subscribers("d/e/f").Subscriptions, "mochi")
+}
+
+func TestServerLoadSubscriptionsForClientCountsNewOnly(t *testing.T) {
+	v := []storage.Subscription{
+		{ID: "sub1", Client: "mochi", Filter: "a/b/c", Qos: 1},
+		{ID: "sub2", Client: "mochi", Filter: "d/e/f"},
+	}
+
+	s := newServer()
+	cl, _, _ := newTestClient()
+	s.loadSubscriptionsForClient(cl, v)
+	s.loadSubscriptionsForClient(cl, v)
+
+	require.Equal(t, int64(2), atomic.LoadInt64(&s.Info.Subscriptions))
+	requireInfoCounts(t, s)
 }
 
 func TestServerLoadInflightMessages(t *testing.T) {
@@ -3668,6 +3770,8 @@ func TestServerLoadRetainedMessages(t *testing.T) {
 	require.Equal(t, 1, len(s.Topics.Messages("d/e/f")))
 	require.Equal(t, 1, len(s.Topics.Messages("h/i/j")))
 	require.Equal(t, 0, len(s.Topics.Messages("w/x/y")))
+	require.Equal(t, int64(3), atomic.LoadInt64(&s.Info.Retained))
+	requireInfoCounts(t, s)
 }
 
 func TestServerClose(t *testing.T) {
@@ -3704,6 +3808,7 @@ func TestServerClose(t *testing.T) {
 	time.Sleep(time.Millisecond)
 	require.Equal(t, false, listener.(*listeners.MockListener).IsServing())
 	require.Equal(t, packets.TPacketData[packets.Disconnect].Get(packets.TDisconnectShuttingDown).RawBytes, <-recv)
+	requireInfoCounts(t, s)
 }
 
 // closeCleanupHook records which disconnect cleanup calls reached the hooks
@@ -3878,10 +3983,16 @@ func TestLoadServerInfoRestoreOnRestart(t *testing.T) {
 	s.Options.Capabilities.Compatibilities.RestoreSysInfoOnRestart = true
 	info := system.Info{
 		BytesReceived: 60,
+		Subscriptions: 999,
+		Inflight:      999,
+		Retained:      999,
 	}
 
 	s.loadServerInfo(info)
 	require.Equal(t, int64(60), s.Info.BytesReceived)
+	require.Equal(t, int64(0), s.Info.Subscriptions)
+	require.Equal(t, int64(0), s.Info.Inflight)
+	require.Equal(t, int64(0), s.Info.Retained)
 }
 
 func TestAtomicItoa(t *testing.T) {

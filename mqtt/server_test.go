@@ -1161,6 +1161,7 @@ func TestInheritClientSessionCleanDropsInflightCount(t *testing.T) {
 	cl := newInflightTakeoverClient(s)
 	require.False(t, s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "mochi", Clean: true}}, cl))
 	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+	require.Equal(t, int64(3), atomic.LoadInt64(&s.Info.InflightDropped))
 	requireInfoCounts(t, s)
 }
 
@@ -3979,6 +3980,56 @@ func TestServerClearExpiredClients(t *testing.T) {
 
 	s.clearExpiredClients(n)
 	require.Equal(t, 2, s.Clients.Len())
+}
+
+// qosDroppedHook counts OnQosDropped calls.
+type qosDroppedHook struct {
+	HookBase
+	dropped atomic.Int32
+}
+
+func (h *qosDroppedHook) ID() string { return "qos-dropped" }
+
+func (h *qosDroppedHook) Provides(b byte) bool { return b == OnQosDropped }
+
+func (h *qosDroppedHook) OnQosDropped(cl *Client, pk packets.Packet) { h.dropped.Add(1) }
+
+func TestServerClearExpiredClientsClearsInflights(t *testing.T) {
+	s := newServer()
+	hook := new(qosDroppedHook)
+	require.NoError(t, s.AddHook(hook, nil))
+	n := time.Now().Unix()
+
+	expiring := newInflightTakeoverClient(s)
+	expiring.ID = "expiring"
+	expiring.ops.hooks = s.hooks // so a hook call would reach the recording hook
+	expiring.State.disconnected = n - 10
+	expiring.State.cancelOpen()
+	expiring.Properties.Props.SessionExpiryInterval = 8
+	expiring.Properties.Props.SessionExpiryIntervalFlag = true
+	addSentInflights(s, expiring)
+	sub := packets.Subscription{Filter: "a/b/c", Qos: 1}
+	s.Topics.Subscribe(expiring.ID, sub)
+	expiring.State.Subscriptions.Add(sub.Filter, sub)
+	atomic.AddInt64(&s.Info.Subscriptions, 1)
+	s.Clients.Add(expiring)
+
+	kept := newInflightTakeoverClient(s) // still connected, so never expires
+	kept.ID = "kept"
+	addSentInflights(s, kept)
+	s.Clients.Add(kept)
+
+	requireInfoCounts(t, s)
+	s.clearExpiredClients(n)
+
+	_, ok := s.Clients.Get("expiring")
+	require.False(t, ok)
+	require.Equal(t, 3, kept.State.Inflight.Len())
+	require.Equal(t, int64(3), atomic.LoadInt64(&s.Info.Inflight))
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Subscriptions))
+	require.Equal(t, int64(3), atomic.LoadInt64(&s.Info.InflightDropped))
+	require.Equal(t, int32(0), hook.dropped.Load())
+	requireInfoCounts(t, s)
 }
 
 func TestLoadServerInfoRestoreOnRestart(t *testing.T) {

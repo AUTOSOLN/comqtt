@@ -90,6 +90,7 @@ func TestProvides(t *testing.T) {
 	require.True(t, h.Provides(mqtt.OnQosComplete))
 	require.True(t, h.Provides(mqtt.OnQosDropped))
 	require.True(t, h.Provides(mqtt.OnSysInfoTick))
+	require.True(t, h.Provides(mqtt.OnSessionDiscarded))
 	require.True(t, h.Provides(mqtt.StoredClients))
 	require.True(t, h.Provides(mqtt.StoredInflightMessages))
 	require.True(t, h.Provides(mqtt.StoredRetainedMessages))
@@ -250,6 +251,45 @@ func TestOnClientExpiredClosedDB(t *testing.T) {
 	require.NoError(t, err)
 	teardown(t, h.config.Path, h)
 	h.OnClientExpired(client)
+}
+
+func TestOnSessionDiscarded(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	a, ab := &mqtt.Client{ID: "a"}, &mqtt.Client{ID: "a:b"}
+	for i, cl := range []*mqtt.Client{a, ab} {
+		h.OnSessionEstablished(cl, packets.Packet{})
+		h.OnSubscribed(cl, packets.Packet{Filters: packets.Subscriptions{{Filter: "x/1"}}}, []byte{0}, []int{1})
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+	}
+
+	h.OnSessionDiscarded(a)
+
+	require.ErrorIs(t, h.db.Get("a", new(storage.Client)), badgerhold.ErrNotFound)
+	subs, err := h.StoredSubscriptionsByCid("a")
+	require.NoError(t, err)
+	require.Empty(t, subs)
+	msgs, err := h.StoredInflightMessagesByCid("a")
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+
+	require.NoError(t, h.db.Get("a:b", new(storage.Client)))
+	subs, err = h.StoredSubscriptionsByCid("a:b")
+	require.NoError(t, err)
+	require.Len(t, subs, 1)
+	msgs, err = h.StoredInflightMessagesByCid("a:b")
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+}
+
+func TestOnSessionDiscardedNoDB(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	h.OnSessionDiscarded(client)
 }
 
 func TestOnSessionEstablishedNoDB(t *testing.T) {
@@ -1087,6 +1127,12 @@ func TestServerRestartLoadsStoredState(t *testing.T) {
 	h.OnSessionEstablish(clean, packets.Packet{Connect: packets.ConnectParams{Clean: true}})
 	h.OnSessionEstablished(clean, packets.Packet{})
 
+	// a v3 clean session left behind by a crash, discarded at load
+	dead := &mqtt.Client{ID: "dead", Properties: mqtt.ClientProperties{ProtocolVersion: 4, Clean: true}}
+	h.OnSessionEstablished(dead, packets.Packet{})
+	h.OnSubscribed(dead, packets.Packet{Filters: packets.Subscriptions{{Filter: "a/dead", Qos: 1}}}, []byte{1}, []int{1})
+	queue(dead, 1)
+
 	h.OnSysInfoTick(&system.Info{Subscriptions: 99, Inflight: 99}) // stale saved counts
 	require.NoError(t, h.Stop())
 
@@ -1113,6 +1159,9 @@ func TestServerRestartLoadsStoredState(t *testing.T) {
 	cl, ok = s.Clients.Get("clean")
 	require.True(t, ok)
 	require.Equal(t, 0, cl.State.Inflight.Len())
+
+	_, ok = s.Clients.Get("dead")
+	require.False(t, ok)
 }
 
 func TestStoredSysInfo(t *testing.T) {

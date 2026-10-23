@@ -108,6 +108,7 @@ func (h *Hook) Provides(b byte) bool {
 		mqtt.OnQosDropped,
 		mqtt.OnSysInfoTick,
 		mqtt.OnClientExpired,
+		mqtt.OnSessionDiscarded,
 		mqtt.OnRetainedExpired,
 		mqtt.StoredClients,
 		mqtt.StoredInflightMessages,
@@ -489,6 +490,19 @@ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 
 	if err := h.deleteInflights(cl.ID); err != nil {
 		h.Log.Error("failed to delete client inflight data", "error", err, "id", cl.ID)
+	}
+}
+
+// OnSessionDiscarded deletes a dead session's client, subscription and inflight rows
+// when the server discards it at startup.
+func (h *Hook) OnSessionDiscarded(cl *mqtt.Client) {
+	if h.db == nil {
+		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+		return
+	}
+
+	if err := h.DeleteSession(cl.ID); err != nil {
+		h.Log.Error("failed to delete discarded session", "error", err, "id", cl.ID)
 	}
 }
 

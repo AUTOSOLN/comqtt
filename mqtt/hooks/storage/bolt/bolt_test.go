@@ -85,6 +85,7 @@ func TestProvides(t *testing.T) {
 	require.True(t, h.Provides(mqtt.OnQosComplete))
 	require.True(t, h.Provides(mqtt.OnQosDropped))
 	require.True(t, h.Provides(mqtt.OnSysInfoTick))
+	require.True(t, h.Provides(mqtt.OnSessionDiscarded))
 	require.True(t, h.Provides(mqtt.StoredClients))
 	require.True(t, h.Provides(mqtt.StoredInflightMessages))
 	require.True(t, h.Provides(mqtt.StoredRetainedMessages))
@@ -286,6 +287,64 @@ func TestOnClientExpiredNoDB(t *testing.T) {
 	h := new(Hook)
 	h.SetOpts(logger, nil)
 	h.OnClientExpired(client)
+}
+
+func TestOnSessionDiscarded(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	a, ab := &mqtt.Client{ID: "a"}, &mqtt.Client{ID: "a:b"}
+	for i, cl := range []*mqtt.Client{a, ab} {
+		h.OnSessionEstablished(cl, packets.Packet{})
+		h.OnSubscribed(cl, packets.Packet{Filters: packets.Subscriptions{{Filter: "x/1"}, {Filter: "x/2"}}}, []byte{0, 0}, []int{1, 1})
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+	}
+
+	check := func() {
+		err := h.db.One("ID", "a", new(storage.Client))
+		require.ErrorIs(t, err, storm.ErrNotFound)
+		require.NoError(t, h.db.One("ID", "a:b", new(storage.Client)))
+
+		subs, err := h.StoredSubscriptions()
+		require.NoError(t, err)
+		got := []string{}
+		for _, sub := range subs {
+			got = append(got, sub.Client)
+		}
+		require.ElementsMatch(t, []string{"a:b", "a:b"}, got)
+
+		msgs, err := h.StoredInflightMessages()
+		require.NoError(t, err)
+		got = []string{}
+		for _, m := range msgs {
+			got = append(got, m.ClientID)
+		}
+		require.ElementsMatch(t, []string{"a:b"}, got)
+	}
+
+	h.OnSessionDiscarded(a)
+	check()
+
+	h.OnSessionDiscarded(a)
+	check()
+}
+
+func TestOnSessionDiscardedClosedDB(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	teardown(t, h.config.Path, h)
+	h.OnSessionDiscarded(client)
+}
+
+func TestOnSessionDiscardedNoDB(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	h.OnSessionDiscarded(client)
 }
 
 func TestOnDisconnectNoDB(t *testing.T) {

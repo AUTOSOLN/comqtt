@@ -142,6 +142,8 @@ func TestProvides(t *testing.T) {
 	require.True(t, s.Provides(mqtt.StoredInflightMessages))
 	require.True(t, s.Provides(mqtt.StoredRetainedMessages))
 	require.True(t, s.Provides(mqtt.StoredSubscriptions))
+	require.True(t, s.Provides(mqtt.StoredSubscriptionsByCid))
+	require.True(t, s.Provides(mqtt.StoredInflightMessagesByCid))
 	require.True(t, s.Provides(mqtt.StoredSysInfo))
 	require.False(t, s.Provides(mqtt.OnACLCheck))
 	require.False(t, s.Provides(mqtt.OnConnectAuthenticate))

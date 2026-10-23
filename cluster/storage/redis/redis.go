@@ -112,6 +112,8 @@ func (s *Storage) Provides(b byte) bool {
 		mqtt.StoredInflightMessages,
 		mqtt.StoredRetainedMessages,
 		mqtt.StoredSubscriptions,
+		mqtt.StoredSubscriptionsByCid,
+		mqtt.StoredInflightMessagesByCid,
 		mqtt.StoredSysInfo,
 	}, []byte{b})
 }

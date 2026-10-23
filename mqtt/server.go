@@ -1889,6 +1889,9 @@ func (s *Server) loadClients(v []storage.Client) (restored int) {
 			continue
 		}
 
+		// restored sessions are offline from load time; downtime before the
+		// restart doesn't count toward expiry.
+		atomic.StoreInt64(&cl.State.disconnected, time.Now().Unix())
 		s.Clients.Add(cl)
 		restored++
 	}
@@ -2005,6 +2008,7 @@ func (s *Server) clearExpiredClients(dt int64) {
 			dropped := client.ClearAllInflightsInMemoryOnly(true)
 			atomic.AddInt64(&s.Info.InflightDropped, int64(dropped))
 			s.UnsubscribeClient(client) // [MQTT-4.1.0-2] clean up topic subscriptions on session expiry
+			client.Stop(nil)            // no-op unless restored; ends the WriteLoop NewClient started
 			s.Clients.Delete(id)        // [MQTT-4.1.0-2]
 		}
 	}

@@ -194,6 +194,25 @@ func TestOnSessionEstablishedThenOnDisconnect(t *testing.T) {
 	require.Empty(t, r3.ID)
 }
 
+func TestOnSessionEstablishedSavesSessionExpiryFlag(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	h := newHook(t, s.Addr())
+	defer teardown(t, h)
+
+	cl := &mqtt.Client{ID: "v5", Properties: mqtt.ClientProperties{
+		ProtocolVersion: 5,
+		Props:           packets.Properties{SessionExpiryInterval: 300, SessionExpiryIntervalFlag: true},
+	}}
+	h.OnSessionEstablished(cl, packets.Packet{})
+
+	r, err := h.StoredClients()
+	require.NoError(t, err)
+	require.Len(t, r, 1)
+	require.Equal(t, uint32(300), r[0].Properties.SessionExpiryInterval)
+	require.True(t, r[0].Properties.SessionExpiryIntervalFlag)
+}
+
 func TestOnSessionEstablishedNoDB(t *testing.T) {
 	s := miniredis.RunT(t)
 	defer s.Close()

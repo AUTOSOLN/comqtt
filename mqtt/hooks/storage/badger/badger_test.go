@@ -904,6 +904,25 @@ func TestStoredClientByCid(t *testing.T) {
 	require.Equal(t, client.Net.Remote, r.Remote)
 }
 
+func TestOnSessionEstablishedSavesSessionExpiryFlag(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	cl := &mqtt.Client{ID: "v5", Properties: mqtt.ClientProperties{
+		ProtocolVersion: 5,
+		Props:           packets.Properties{SessionExpiryInterval: 300, SessionExpiryIntervalFlag: true},
+	}}
+	h.OnSessionEstablished(cl, packets.Packet{})
+
+	r, err := h.StoredClientByCid("v5")
+	require.NoError(t, err)
+	require.Equal(t, uint32(300), r.Properties.SessionExpiryInterval)
+	require.True(t, r.Properties.SessionExpiryIntervalFlag)
+}
+
 func TestStoredClientByCidNotFound(t *testing.T) {
 	h := new(Hook)
 	h.SetOpts(logger, nil)

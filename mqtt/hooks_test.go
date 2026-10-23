@@ -253,6 +253,7 @@ func TestHooksNonReturns(t *testing.T) {
 			h.OnPacketIDExhausted(cl, packets.Packet{})
 			h.OnWillSent(cl, packets.Packet{})
 			h.OnClientExpired(cl)
+			h.OnSessionDiscarded(cl)
 			h.OnRetainedExpired("a/b/c")
 
 			// on second iteration, check added hook methods

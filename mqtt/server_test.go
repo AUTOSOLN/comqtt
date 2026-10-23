@@ -3528,6 +3528,49 @@ func TestServerLoadClients(t *testing.T) {
 	require.Equal(t, "mochi", cl.ID)
 }
 
+// sessionDiscardedHook records the clients passed to OnSessionDiscarded.
+type sessionDiscardedHook struct {
+	HookBase
+	discarded []*Client
+}
+
+func (h *sessionDiscardedHook) ID() string { return "session-discarded" }
+
+func (h *sessionDiscardedHook) Provides(b byte) bool { return b == OnSessionDiscarded }
+
+func (h *sessionDiscardedHook) OnSessionDiscarded(cl *Client) { h.discarded = append(h.discarded, cl) }
+
+func TestServerLoadClientsDiscardsDeadSessions(t *testing.T) {
+	v := []storage.Client{
+		{ID: "v3-clean", ProtocolVersion: 4, Clean: true},
+		{ID: "v5-expiry-0", ProtocolVersion: 5},
+		{ID: "v5-persistent", ProtocolVersion: 5, Properties: storage.ClientProperties{SessionExpiryInterval: 300, SessionExpiryIntervalFlag: true}},
+		{ID: "v3-persistent", ProtocolVersion: 4, Clean: false},
+	}
+
+	s := newServer()
+	hook := new(sessionDiscardedHook)
+	require.NoError(t, s.AddHook(hook, nil))
+
+	require.Equal(t, 2, s.loadClients(v))
+	require.Equal(t, 2, s.Clients.Len())
+	_, ok := s.Clients.Get("v5-persistent")
+	require.True(t, ok)
+	_, ok = s.Clients.Get("v3-persistent")
+	require.True(t, ok)
+
+	ids := make([]string, 0, len(hook.discarded))
+	for _, cl := range hook.discarded {
+		ids = append(ids, cl.ID)
+		require.True(t, cl.Closed())
+	}
+	require.ElementsMatch(t, []string{"v3-clean", "v5-expiry-0"}, ids)
+
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Subscriptions))
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+	requireInfoCounts(t, s)
+}
+
 func TestServerLoadSubscriptions(t *testing.T) {
 	v := []storage.Subscription{
 		{ID: "sub1", Client: "mochi", Filter: "a/b/c"},

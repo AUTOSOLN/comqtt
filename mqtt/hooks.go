@@ -49,6 +49,7 @@ const (
 	OnWill
 	OnWillSent
 	OnClientExpired
+	OnSessionDiscarded
 	OnRetainedExpired
 	OnPublishedWithSharedFilters
 	StoredClients
@@ -106,6 +107,7 @@ type Hook interface {
 	OnWill(cl *Client, will Will) (Will, error)
 	OnWillSent(cl *Client, pk packets.Packet)
 	OnClientExpired(cl *Client)
+	OnSessionDiscarded(cl *Client)
 	OnRetainedExpired(filter string)
 	OnPublishedWithSharedFilters(pk packets.Packet, sharedFilters map[string]bool)
 	StoredClients() ([]storage.Client, error)
@@ -651,6 +653,20 @@ func (h *Hooks) OnClientExpired(cl *Client) {
 	}
 }
 
+// OnSessionDiscarded is called at startup for each stored session that should have
+// ended on disconnect (v3 clean session or v5 expiry 0), so storage can delete it.
+func (h *Hooks) OnSessionDiscarded(cl *Client) {
+	if h.halting.Load() {
+		return
+	}
+
+	for _, hook := range h.GetAll() {
+		if hook.Provides(OnSessionDiscarded) {
+			hook.OnSessionDiscarded(cl)
+		}
+	}
+}
+
 // OnRetainedExpired is called when a retained message has expired and should be deleted.
 func (h *Hooks) OnRetainedExpired(filter string) {
 	if h.halting.Load() {
@@ -1064,6 +1080,9 @@ func (h *HookBase) OnWillSent(cl *Client, pk packets.Packet) {}
 
 // OnClientExpired is called when a client session has expired.
 func (h *HookBase) OnClientExpired(cl *Client) {}
+
+// OnSessionDiscarded is called when a dead stored session is discarded at startup.
+func (h *HookBase) OnSessionDiscarded(cl *Client) {}
 
 // OnRetainedExpired is called when a retained message for a topic has expired.
 func (h *HookBase) OnRetainedExpired(topic string) {}

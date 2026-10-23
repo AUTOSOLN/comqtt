@@ -1771,8 +1771,8 @@ func (s *Server) readStore() error {
 		if err != nil {
 			return fmt.Errorf("failed to load clients; %w", err)
 		}
-		s.loadClients(clients)
-		s.Log.Debug("loaded clients from store", "len", len(clients))
+		restored := s.loadClients(clients)
+		s.Log.Debug("loaded clients from store", "len", restored, "discarded", len(clients)-restored)
 	}
 
 	if s.hooks.Provides(StoredSubscriptions) {
@@ -1867,8 +1867,11 @@ func (s *Server) loadSubscriptions(v []storage.Subscription) {
 	}
 }
 
-// loadClients restores clients from the datastore.
-func (s *Server) loadClients(v []storage.Client) {
+// loadClients restores clients from the datastore. Sessions that should have
+// ended at disconnect (v3 clean session, v5 expiry 0) survive a crash because
+// the disconnect path never ran; those are discarded through OnSessionDiscarded
+// instead.
+func (s *Server) loadClients(v []storage.Client) (restored int) {
 	for _, c := range v {
 		cl := s.NewClient(nil, c.Listener, c.ID, false)
 		cl.Properties.Username = c.Username
@@ -1888,8 +1891,20 @@ func (s *Server) loadClients(v []storage.Client) {
 			MaximumPacketSize:         c.Properties.MaximumPacketSize,
 		}
 		cl.Properties.Will = Will(c.Will)
+
+		// same expression as expire in attachClient's disconnect path
+		if (cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0) || (cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean) {
+			s.Log.Debug("discarding dead session from store", "client", cl.ID, "protocol", cl.Properties.ProtocolVersion)
+			s.hooks.OnSessionDiscarded(cl)
+			cl.Stop(nil) // ends the WriteLoop NewClient started
+			continue
+		}
+
 		s.Clients.Add(cl)
+		restored++
 	}
+
+	return restored
 }
 
 // restoreInflightExpiry sets Expiry on an inflight packet restored from

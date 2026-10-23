@@ -341,26 +341,43 @@ func TestOnDisconnectClosedDB(t *testing.T) {
 }
 
 func TestOnDisconnectSessionTakenOver(t *testing.T) {
-	h := new(Hook)
-	h.SetOpts(logger, nil)
-	err := h.Init(nil)
-	require.NoError(t, err)
+	for _, tc := range []struct {
+		name    string
+		expire  bool
+		deleted bool // the broker removed the row with DeleteSession before the old copy disconnected
+	}{
+		{name: "keep", expire: false},
+		{name: "expire", expire: true},
+		{name: "deleted keep", expire: false, deleted: true},
+		{name: "deleted expire", expire: true, deleted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := new(Hook)
+			h.SetOpts(logger, nil)
+			err := h.Init(nil)
+			require.NoError(t, err)
+			defer teardown(t, h.config.Path, h)
 
-	testClient := &mqtt.Client{
-		ID: "test",
-		Net: mqtt.ClientConnection{
-			Remote:   "test.addr",
-			Listener: "listener",
-		},
-		Properties: mqtt.ClientProperties{
-			Username: []byte("username"),
-			Clean:    false,
-		},
+			newCl := &mqtt.Client{ID: "test", Net: mqtt.ClientConnection{Remote: "new.addr"}}
+			h.OnSessionEstablished(newCl, packets.Packet{})
+			if tc.deleted {
+				require.NoError(t, h.DeleteSession("test"))
+			}
+
+			oldCl := &mqtt.Client{ID: "test", Net: mqtt.ClientConnection{Remote: "old.addr"}}
+			oldCl.Stop(packets.ErrSessionTakenOver)
+			h.OnDisconnect(oldCl, nil, tc.expire)
+
+			r := new(storage.Client)
+			err = h.db.Get("test", r)
+			if tc.deleted {
+				require.ErrorIs(t, err, badgerhold.ErrNotFound)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, "new.addr", r.Remote)
+		})
 	}
-
-	testClient.Stop(packets.ErrSessionTakenOver)
-	teardown(t, h.config.Path, h)
-	h.OnDisconnect(testClient, nil, true)
 }
 
 func TestOnSubscribedThenOnUnsubscribed(t *testing.T) {

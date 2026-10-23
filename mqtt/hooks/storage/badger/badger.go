@@ -218,13 +218,15 @@ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 		return
 	}
 
-	h.updateClient(cl)
-
-	if !expire {
+	// a taken-over copy's row belongs to the new owner (written by
+	// OnSessionEstablished, or deleted by the broker), so don't write it back.
+	if cl.StopCause() == packets.ErrSessionTakenOver {
 		return
 	}
 
-	if cl.StopCause() == packets.ErrSessionTakenOver {
+	h.updateClient(cl)
+
+	if !expire {
 		return
 	}
 

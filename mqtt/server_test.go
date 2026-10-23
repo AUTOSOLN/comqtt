@@ -273,6 +273,87 @@ func TestServerServeReadStoreFailure(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestServerServeFiresOnStoreLoaded(t *testing.T) {
+	s := newServer()
+	defer s.Close()
+
+	require.NoError(t, s.AddHook(new(storedStateHook), nil))
+	var clientLoaded, subLoaded bool
+	hook := new(storeLoadedHook)
+	hook.onLoaded = func() {
+		_, clientLoaded = s.Clients.Get("mochi")
+		_, subLoaded = s.Topics.Subscribers("a/b/c").Subscriptions["mochi"]
+	}
+	require.NoError(t, s.AddHook(hook, nil))
+	require.NoError(t, s.AddListener(listeners.NewMockListener("t1", ":1882")))
+
+	require.NoError(t, s.Serve())
+	require.True(t, clientLoaded)
+	require.True(t, subLoaded)
+	require.Equal(t, 1, hook.loaded)
+}
+
+func TestServerServeOnStoreLoadedBeforeEventLoop(t *testing.T) {
+	s := newServer()
+	defer s.Close()
+
+	s.loop.sysTopics = time.NewTicker(time.Millisecond)
+	s.loop.clientExpiry = time.NewTicker(time.Millisecond)
+
+	require.NoError(t, s.AddHook(new(zombieStoreHook), nil))
+	ml := listeners.NewMockListener("t1", ":1882")
+	require.NoError(t, s.AddListener(ml))
+
+	var ticksDuring int64
+	var servingDuring bool
+	var short *Client
+	hook := new(storeLoadedHook)
+	hook.onLoaded = func() {
+		time.Sleep(time.Millisecond * 5)
+		ticksDuring = hook.sysTicks.Load()
+		servingDuring = ml.IsServing()
+
+		var ok bool
+		short, ok = s.Clients.Get("short")
+		require.True(t, ok)
+		s.RemoveClientInMemoryOnly(short)
+	}
+	require.NoError(t, s.AddHook(hook, nil))
+
+	require.NoError(t, s.Serve())
+	time.Sleep(time.Millisecond * 5)
+
+	require.Equal(t, int64(0), ticksDuring)
+	require.False(t, servingDuring)
+
+	_, ok := s.Clients.Get("short")
+	require.False(t, ok)
+	require.True(t, short.Closed()) // WriteLoop ended
+	_, ok = s.Clients.Get("keep")
+	require.True(t, ok)
+	subs := s.Topics.Subscribers("a/b/c").Subscriptions
+	require.Contains(t, subs, "keep")
+	require.NotContains(t, subs, "short")
+	require.Empty(t, s.Topics.Subscribers("s/only").Subscriptions)
+	requireInfoCounts(t, s)
+
+	require.Equal(t, int64(0), hook.expired.Load())
+	require.Equal(t, int64(0), hook.unsubscribed.Load())
+	require.Greater(t, hook.sysTicks.Load(), int64(0))
+}
+
+func TestServerServeOnStoreLoadedNoStore(t *testing.T) {
+	s := newServer()
+	defer s.Close()
+
+	hook := new(storeLoadedHook)
+	require.NoError(t, s.AddHook(hook, nil))
+	require.NoError(t, s.AddListener(listeners.NewMockListener("t1", ":1882")))
+
+	require.NoError(t, s.Serve())
+	require.Equal(t, 1, hook.loaded)
+}
+
 func TestServerEventLoop(t *testing.T) {
 	s := newServer()
 	defer s.Close()
@@ -3573,6 +3654,70 @@ func (h *sessionDiscardedHook) ID() string { return "session-discarded" }
 func (h *sessionDiscardedHook) Provides(b byte) bool { return b == OnSessionDiscarded }
 
 func (h *sessionDiscardedHook) OnSessionDiscarded(cl *Client) { h.discarded = append(h.discarded, cl) }
+
+// storeLoadedHook calls onLoaded from OnStoreLoaded and counts the events tests watch.
+type storeLoadedHook struct {
+	HookBase
+	onLoaded     func()
+	loaded       int
+	sysTicks     atomic.Int64
+	expired      atomic.Int64
+	unsubscribed atomic.Int64
+}
+
+func (h *storeLoadedHook) ID() string { return "store-loaded" }
+
+func (h *storeLoadedHook) Provides(b byte) bool {
+	return bytes.Contains([]byte{OnStoreLoaded, OnSysInfoTick, OnClientExpired, OnUnsubscribed}, []byte{b})
+}
+
+func (h *storeLoadedHook) OnStoreLoaded() {
+	h.loaded++
+	if h.onLoaded != nil {
+		h.onLoaded()
+	}
+}
+
+func (h *storeLoadedHook) OnSysInfoTick(*system.Info) { h.sysTicks.Add(1) }
+
+func (h *storeLoadedHook) OnClientExpired(cl *Client) { h.expired.Add(1) }
+
+func (h *storeLoadedHook) OnUnsubscribed(cl *Client, pk packets.Packet, reasonCodes []byte, counts []int) {
+	h.unsubscribed.Add(1)
+}
+
+// zombieStoreHook returns a short-expiry client to remove from OnStoreLoaded
+// and a long-lived one to keep.
+type zombieStoreHook struct {
+	HookBase
+}
+
+func (h *zombieStoreHook) ID() string { return "zombie-store" }
+
+func (h *zombieStoreHook) Provides(b byte) bool {
+	return bytes.Contains([]byte{StoredClients, StoredSubscriptions, StoredInflightMessages}, []byte{b})
+}
+
+func (h *zombieStoreHook) StoredClients() ([]storage.Client, error) {
+	return []storage.Client{
+		{ID: "short", ProtocolVersion: 5, Properties: storage.ClientProperties{SessionExpiryInterval: 1, SessionExpiryIntervalFlag: true}},
+		{ID: "keep", ProtocolVersion: 5, Properties: storage.ClientProperties{SessionExpiryInterval: 3600, SessionExpiryIntervalFlag: true}},
+	}, nil
+}
+
+func (h *zombieStoreHook) StoredSubscriptions() ([]storage.Subscription, error) {
+	return []storage.Subscription{
+		{ID: "sub1", Client: "short", Filter: "a/b/c", Qos: 1},
+		{ID: "sub2", Client: "keep", Filter: "a/b/c", Qos: 1},
+		{ID: "sub3", Client: "short", Filter: "s/only"},
+	}, nil
+}
+
+func (h *zombieStoreHook) StoredInflightMessages() ([]storage.Message, error) {
+	return []storage.Message{
+		{ClientID: "short", PacketID: 1, TopicName: "a/b/c"},
+	}, nil
+}
 
 func TestServerLoadClientsDiscardsDeadSessions(t *testing.T) {
 	v := []storage.Client{

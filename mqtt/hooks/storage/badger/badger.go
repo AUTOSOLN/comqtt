@@ -157,7 +157,9 @@ func (h *Hook) OnSessionEstablish(cl *mqtt.Client, pk packets.Packet) {
 	}
 
 	if pk.Connect.Clean {
-		h.deleteInflights(cl.ID)
+		if err := h.deleteInflights(cl.ID); err != nil {
+			h.Log.Error("failed to delete client inflight data", "error", err, "id", cl.ID)
+		}
 	}
 }
 
@@ -276,6 +278,36 @@ func (h *Hook) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []
 			h.Log.Error("failed to delete subscription data", "error", err, "data", subscriptionKey(cl, pk.Filters[i].Filter))
 		}
 	}
+}
+
+// DeleteSession removes the client row, subscription rows and inflight rows for
+// a client id outside the hook lifecycle (e.g. the broker's session-expiry apply).
+// It fires no hooks and touches no server state. It is idempotent: it returns
+// nil if nothing is stored for the id.
+func (h *Hook) DeleteSession(clientID string) error {
+	if h.db == nil {
+		return storage.ErrDBFileNotOpen
+	}
+
+	err := h.db.Delete(clientID, new(storage.Client))
+	if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
+		return err
+	}
+
+	subs, err := h.StoredSubscriptionsByCid(clientID)
+	if err != nil {
+		return err
+	}
+	// full scan of subscription rows per call (no index on Client); add one, or a
+	// batched delete, if the discard volume at startup makes it matter.
+	for _, sub := range subs {
+		err = h.db.Delete(sub.ID, new(storage.Subscription))
+		if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
+			return err
+		}
+	}
+
+	return h.deleteInflights(clientID)
 }
 
 // OnRetainMessage adds a retained message for a topic to the store.
@@ -411,19 +443,21 @@ func (h *Hook) OnRetainedExpired(filter string) {
 	}
 }
 
-// deleteInflights deletes every stored inflight message for the client id.
-func (h *Hook) deleteInflights(cid string) {
+// deleteInflights deletes every stored inflight message for the client id and
+// returns the first error.
+func (h *Hook) deleteInflights(cid string) error {
 	msgs, err := h.StoredInflightMessagesByCid(cid)
 	if err != nil {
-		h.Log.Error("failed to read client inflight data", "error", err, "id", cid)
-		return
+		return err
 	}
 
 	for _, m := range msgs {
-		if err = h.db.Delete(m.ID, new(storage.Message)); err != nil {
-			h.Log.Error("failed to delete client inflight data", "error", err, "id", m.ID)
+		if err = h.db.Delete(m.ID, new(storage.Message)); err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
+			return err
 		}
 	}
+
+	return nil
 }
 
 // OnClientExpired deletes expired clients and their inflight messages from the store.
@@ -438,7 +472,9 @@ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 		h.Log.Error("failed to delete expired client data", "error", err, "id", clientKey(cl))
 	}
 
-	h.deleteInflights(cl.ID)
+	if err := h.deleteInflights(cl.ID); err != nil {
+		h.Log.Error("failed to delete client inflight data", "error", err, "id", cl.ID)
+	}
 }
 
 // StoredClients returns all stored clients from the store.

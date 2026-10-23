@@ -365,6 +365,49 @@ func TestOnSubscribedSkipsRefusedFilters(t *testing.T) {
 	require.Equal(t, "a/b/c", subs[0].Filter)
 }
 
+func TestDeleteSession(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	a, ab := &mqtt.Client{ID: "a"}, &mqtt.Client{ID: "a:b"}
+	for i, cl := range []*mqtt.Client{a, ab} {
+		h.OnSessionEstablished(cl, packets.Packet{})
+		h.OnSubscribed(cl, packets.Packet{Filters: packets.Subscriptions{{Filter: "x/1"}, {Filter: "x/2"}}}, []byte{0, 0}, []int{1, 1})
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i*2 + 1)}, time.Now().Unix(), 0)
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i*2 + 2)}, time.Now().Unix(), 0)
+	}
+
+	require.NoError(t, h.DeleteSession("a"))
+
+	require.ErrorIs(t, h.db.Get("a", new(storage.Client)), badgerhold.ErrNotFound)
+	subs, err := h.StoredSubscriptionsByCid("a")
+	require.NoError(t, err)
+	require.Empty(t, subs)
+	msgs, err := h.StoredInflightMessagesByCid("a")
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+
+	require.NoError(t, h.db.Get("a:b", new(storage.Client)))
+	subs, err = h.StoredSubscriptionsByCid("a:b")
+	require.NoError(t, err)
+	require.Len(t, subs, 2)
+	msgs, err = h.StoredInflightMessagesByCid("a:b")
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+
+	require.NoError(t, h.DeleteSession("a"))
+	require.NoError(t, h.DeleteSession("never-seen"))
+}
+
+func TestDeleteSessionNoDB(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	require.ErrorIs(t, h.DeleteSession("cl1"), storage.ErrDBFileNotOpen)
+}
+
 func TestOnSubscribedNoDB(t *testing.T) {
 	h := new(Hook)
 	h.SetOpts(logger, nil)

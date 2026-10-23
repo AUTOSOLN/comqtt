@@ -6,9 +6,12 @@ package badger
 
 import (
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -994,6 +997,79 @@ func TestStoredByCidSurvivesRestart(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
 	require.Equal(t, []byte("queued"), msgs[0].Payload)
+}
+
+// TestServerRestartLoadsStoredState writes rows through the hook the way the server
+// would, then restarts a real server on them, so the hook and the loaders are checked
+// against each other rather than each against a fake.
+func TestServerRestartLoadsStoredState(t *testing.T) {
+	dir := t.TempDir()
+
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	require.NoError(t, h.Init(&Options{Path: dir}))
+
+	now := time.Now().Unix()
+	queue := func(cl *mqtt.Client, id uint16) {
+		h.OnQosPublish(cl, packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: 1},
+			PacketID:    id,
+			TopicName:   "a/allowed",
+			Origin:      "pub",
+			Created:     now,
+		}, now, 0)
+	}
+
+	// a persistent subscriber with one refused filter and two messages queued by pub
+	sub, pub := &mqtt.Client{ID: "sub"}, &mqtt.Client{ID: "pub"}
+	h.OnSessionEstablished(sub, packets.Packet{})
+	h.OnSessionEstablished(pub, packets.Packet{})
+	h.OnSubscribed(sub, packets.Packet{Filters: packets.Subscriptions{
+		{Filter: "a/allowed", Qos: 1},
+		{Filter: "a/denied", Qos: 1},
+	}}, []byte{1, 0x80}, []int{1, 0})
+	queue(sub, 1)
+	queue(sub, 2)
+
+	// a session that expired with a message queued
+	expired := &mqtt.Client{ID: "expired"}
+	h.OnSessionEstablished(expired, packets.Packet{})
+	queue(expired, 1)
+	h.OnClientExpired(expired)
+
+	// a session that reconnected with clean start, discarding its queued message
+	clean := &mqtt.Client{ID: "clean"}
+	h.OnSessionEstablished(clean, packets.Packet{})
+	queue(clean, 1)
+	h.OnSessionEstablish(clean, packets.Packet{Connect: packets.ConnectParams{Clean: true}})
+	h.OnSessionEstablished(clean, packets.Packet{})
+
+	h.OnSysInfoTick(&system.Info{Subscriptions: 99, Inflight: 99}) // stale saved counts
+	require.NoError(t, h.Stop())
+
+	s := mqtt.New(&mqtt.Options{Logger: logger})
+	require.NoError(t, s.AddHook(new(Hook), &Options{Path: dir}))
+	require.NoError(t, s.Serve())
+	defer s.Close()
+
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.Subscriptions))
+	require.Equal(t, int64(2), atomic.LoadInt64(&s.Info.Inflight))
+
+	cl, ok := s.Clients.Get("sub")
+	require.True(t, ok)
+	require.Equal(t, []string{"a/allowed"}, slices.Collect(maps.Keys(cl.State.Subscriptions.GetAll())))
+	require.Equal(t, 2, cl.State.Inflight.Len())
+
+	cl, ok = s.Clients.Get("pub")
+	require.True(t, ok)
+	require.Equal(t, 0, cl.State.Inflight.Len())
+
+	_, ok = s.Clients.Get("expired")
+	require.False(t, ok)
+
+	cl, ok = s.Clients.Get("clean")
+	require.True(t, ok)
+	require.Equal(t, 0, cl.State.Inflight.Len())
 }
 
 func TestStoredSysInfo(t *testing.T) {

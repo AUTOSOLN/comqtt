@@ -20,6 +20,7 @@ const (
 	SetOptions byte = iota
 	OnSysInfoTick
 	OnStarted
+	OnStoreLoaded
 	OnStopped
 	OnConnectAuthenticate
 	OnACLCheck
@@ -77,6 +78,7 @@ type Hook interface {
 	Stop() error
 	SetOpts(l *slog.Logger, o *HookOptions)
 	OnStarted()
+	OnStoreLoaded()
 	OnStopped()
 	OnConnectAuthenticate(cl *Client, pk packets.Packet) bool
 	OnACLCheck(cl *Client, topic string, write bool) bool
@@ -222,6 +224,16 @@ func (h *Hooks) OnStarted() {
 	for _, hook := range h.GetAll() {
 		if hook.Provides(OnStarted) {
 			hook.OnStarted()
+		}
+	}
+}
+
+// OnStoreLoaded is called after stored state loads, before the event loop and listeners
+// start. The server won't touch Clients, Topics or Info until every handler returns.
+func (h *Hooks) OnStoreLoaded() {
+	for _, hook := range h.GetAll() {
+		if hook.Provides(OnStoreLoaded) {
+			hook.OnStoreLoaded()
 		}
 	}
 }
@@ -967,6 +979,9 @@ func (h *HookBase) Stop() error {
 
 // OnStarted is called when the server starts.
 func (h *HookBase) OnStarted() {}
+
+// OnStoreLoaded is called after the server loads stored state, before it starts serving.
+func (h *HookBase) OnStoreLoaded() {}
 
 // OnStopped is called when the server stops.
 func (h *HookBase) OnStopped() {}

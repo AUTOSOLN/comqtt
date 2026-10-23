@@ -105,6 +105,7 @@ func TestProvides(t *testing.T) {
 	require.True(t, h.Provides(mqtt.OnQosComplete))
 	require.True(t, h.Provides(mqtt.OnQosDropped))
 	require.True(t, h.Provides(mqtt.OnSysInfoTick))
+	require.True(t, h.Provides(mqtt.OnSessionDiscarded))
 	require.True(t, h.Provides(mqtt.StoredClients))
 	require.True(t, h.Provides(mqtt.StoredInflightMessages))
 	require.True(t, h.Provides(mqtt.StoredRetainedMessages))
@@ -319,6 +320,59 @@ func TestOnClientExpiredNoDB(t *testing.T) {
 	h := newHook(t, s.Addr())
 	h.db = nil
 	h.OnClientExpired(client)
+}
+
+func TestOnSessionDiscarded(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	h := newHook(t, s.Addr())
+	defer teardown(t, h)
+
+	// every "a:b" field starts with "a:", so a prefix match would delete them too
+	a := &mqtt.Client{ID: "a"}
+	ab := &mqtt.Client{ID: "a:b"}
+	for i, f := range []struct {
+		cl      *mqtt.Client
+		filters packets.Subscriptions
+	}{
+		{a, packets.Subscriptions{{Filter: "x/1"}, {Filter: "y/2"}}},
+		{ab, packets.Subscriptions{{Filter: "x/1"}, {Filter: "c/d"}}},
+	} {
+		h.OnSessionEstablished(f.cl, packets.Packet{})
+		h.OnSubscribed(f.cl, packets.Packet{Filters: f.filters}, []byte{0, 0}, nil)
+		h.OnQosPublish(f.cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+	}
+
+	h.OnSessionDiscarded(a)
+
+	_, err := h.db.HGet(h.ctx, h.hKey(storage.ClientKey), clientKey(a)).Result()
+	require.ErrorIs(t, err, redis.Nil)
+	_, err = h.db.HGet(h.ctx, h.hKey(storage.ClientKey), clientKey(ab)).Result()
+	require.NoError(t, err)
+
+	fields, err := h.db.HKeys(h.ctx, h.hKey(storage.SubscriptionKey)).Result()
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"a:b:x/1", "a:b:c/d"}, fields)
+
+	fields, err = h.db.HKeys(h.ctx, h.hKey(storage.InflightKey)).Result()
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"a:b:2"}, fields)
+}
+
+func TestOnSessionDiscardedClosedDB(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	h := newHook(t, s.Addr())
+	teardown(t, h)
+	h.OnSessionDiscarded(client)
+}
+
+func TestOnSessionDiscardedNoDB(t *testing.T) {
+	s := miniredis.RunT(t)
+	defer s.Close()
+	h := newHook(t, s.Addr())
+	h.db = nil
+	h.OnSessionDiscarded(client)
 }
 
 func TestOnDisconnectNoDB(t *testing.T) {

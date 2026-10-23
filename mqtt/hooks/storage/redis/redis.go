@@ -94,6 +94,7 @@ func (h *Hook) Provides(b byte) bool {
 		mqtt.OnWillSent,
 		mqtt.OnSysInfoTick,
 		mqtt.OnClientExpired,
+		mqtt.OnSessionDiscarded,
 		mqtt.OnRetainedExpired,
 		mqtt.StoredClients,
 		mqtt.StoredInflightMessages,
@@ -161,7 +162,9 @@ func (h *Hook) OnSessionEstablish(cl *mqtt.Client, pk packets.Packet) {
 	}
 
 	if pk.Connect.Clean {
-		h.deleteInflights(cl.ID)
+		if err := h.deleteInflights(cl.ID); err != nil {
+			h.Log.Error("failed to delete client inflight data", "error", err, "id", cl.ID)
+		}
 	}
 }
 
@@ -424,17 +427,32 @@ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 		h.Log.Error("failed to delete expired client", "error", err, "id", clientKey(cl))
 	}
 
-	h.deleteInflights(cl.ID)
+	if err := h.deleteInflights(cl.ID); err != nil {
+		h.Log.Error("failed to delete client inflight data", "error", err, "id", cl.ID)
+	}
 }
 
-// deleteInflights deletes every stored inflight message for the client id.
-func (h *Hook) deleteInflights(cid string) {
+// OnSessionDiscarded deletes a dead session's client, subscription and inflight entries
+// when the server discards it at startup.
+func (h *Hook) OnSessionDiscarded(cl *mqtt.Client) {
+	if h.db == nil {
+		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+		return
+	}
+
+	if err := h.deleteSession(cl.ID); err != nil {
+		h.Log.Error("failed to delete discarded session", "error", err, "id", cl.ID)
+	}
+}
+
+// deleteInflights deletes every stored inflight message for the client id and
+// returns the first error.
+func (h *Hook) deleteInflights(cid string) error {
 	// reads every inflight field name per call; HSCAN if the inflight hash
 	// gets large.
 	fields, err := h.db.HKeys(h.ctx, h.hKey(storage.InflightKey)).Result()
 	if err != nil {
-		h.Log.Error("failed to read client inflight keys", "error", err, "id", cid)
-		return
+		return err
 	}
 
 	var matched []string
@@ -444,12 +462,49 @@ func (h *Hook) deleteInflights(cid string) {
 		}
 	}
 	if len(matched) == 0 {
-		return
+		return nil
 	}
 
-	if err = h.db.HDel(h.ctx, h.hKey(storage.InflightKey), matched...).Err(); err != nil {
-		h.Log.Error("failed to delete client inflight data", "error", err, "id", cid)
+	return h.db.HDel(h.ctx, h.hKey(storage.InflightKey), matched...).Err()
+}
+
+// deleteSession removes the client, subscription and inflight entries for a client
+// id. It returns nil if nothing is stored for the id.
+func (h *Hook) deleteSession(cid string) error {
+	if h.db == nil {
+		return storage.ErrDBFileNotOpen
 	}
+
+	if err := h.db.HDel(h.ctx, h.hKey(storage.ClientKey), cid).Err(); err != nil {
+		return err
+	}
+
+	// reads the whole subscription hash per call; HSCAN or a per-client hash if
+	// it gets large.
+	rows, err := h.db.HGetAll(h.ctx, h.hKey(storage.SubscriptionKey)).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+
+	var matched []string
+	for field, row := range rows {
+		var sub storage.Subscription
+		if err = sub.UnmarshalBinary([]byte(row)); err != nil {
+			// one corrupt row shouldn't block discarding this session
+			h.Log.Error("failed to unmarshal subscription data", "error", err, "data", row)
+			continue
+		}
+		if sub.Client == cid { // decoded, not a field prefix: ids and filters can both contain ':'
+			matched = append(matched, field)
+		}
+	}
+	if len(matched) > 0 {
+		if err = h.db.HDel(h.ctx, h.hKey(storage.SubscriptionKey), matched...).Err(); err != nil {
+			return err
+		}
+	}
+
+	return h.deleteInflights(cid)
 }
 
 // StoredClients returns all stored clients from the store.

@@ -234,6 +234,7 @@ func TestHooksNonReturns(t *testing.T) {
 		t.Run("step-"+strconv.Itoa(i), func(t *testing.T) {
 			// on first iteration, check without hook methods
 			h.OnStarted()
+			h.OnStoreLoaded()
 			h.OnStopped()
 			h.OnSysInfoTick(new(system.Info))
 			h.OnSessionEstablish(cl, packets.Packet{})

@@ -325,6 +325,10 @@ func (s *Server) Serve() error {
 		}
 	}
 
+	// before the event loop and listeners, so handlers can change loaded state
+	// before expiry or a client acts on it.
+	s.hooks.OnStoreLoaded()
+
 	go s.eventLoop()                            // spin up event loop for issuing $SYS values and closing server.
 	s.Listeners.ServeAll(s.EstablishConnection) // start listening on all listeners.
 	s.publishSysTopics()                        // begin publishing $SYS system values.
@@ -1897,6 +1901,21 @@ func (s *Server) loadClients(v []storage.Client) (restored int) {
 	}
 
 	return restored
+}
+
+// RemoveClientInMemoryOnly removes an offline client from the server without
+// calling any hooks, so storage is not touched. Its subscriptions and inflights
+// are uncounted and the WriteLoop NewClient started is stopped.
+func (s *Server) RemoveClientInMemoryOnly(cl *Client) {
+	for filter := range cl.State.Subscriptions.GetAll() {
+		cl.State.Subscriptions.Delete(filter)
+		if ok, _ := s.Topics.Unsubscribe(filter, cl.ID); ok {
+			atomic.AddInt64(&s.Info.Subscriptions, -1)
+		}
+	}
+	cl.ClearAllInflightsInMemoryOnly(true)
+	cl.Stop(nil)
+	s.Clients.Delete(cl.ID)
 }
 
 // restoreInflightExpiry sets Expiry on an inflight packet restored from

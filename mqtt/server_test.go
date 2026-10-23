@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"strconv"
 	"sync"
@@ -4131,6 +4132,50 @@ func TestServerClearExpiredClientsClearsInflights(t *testing.T) {
 	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Subscriptions))
 	require.Equal(t, int64(3), atomic.LoadInt64(&s.Info.InflightDropped))
 	require.Equal(t, int32(0), hook.dropped.Load())
+	requireInfoCounts(t, s)
+}
+
+// clientExpiredHook records the clients passed to OnClientExpired.
+type clientExpiredHook struct {
+	HookBase
+	expired []*Client
+}
+
+func (h *clientExpiredHook) ID() string { return "client-expired" }
+
+func (h *clientExpiredHook) Provides(b byte) bool { return b == OnClientExpired }
+
+func (h *clientExpiredHook) OnClientExpired(cl *Client) { h.expired = append(h.expired, cl) }
+
+func TestServerLoadClientsStartsExpiry(t *testing.T) {
+	v := []storage.Client{
+		{ID: "short", ProtocolVersion: 5, Properties: storage.ClientProperties{SessionExpiryInterval: 1, SessionExpiryIntervalFlag: true}},
+		{ID: "long", ProtocolVersion: 5, Properties: storage.ClientProperties{SessionExpiryInterval: 3600, SessionExpiryIntervalFlag: true}},
+		// row saved before the stores kept the flag: falls back to MaximumSessionExpiryInterval
+		{ID: "no-flag", ProtocolVersion: 5, Properties: storage.ClientProperties{SessionExpiryInterval: 1}},
+	}
+
+	s := newServer()
+	require.Equal(t, uint32(math.MaxUint32), s.Options.Capabilities.MaximumSessionExpiryInterval)
+	hook := new(clientExpiredHook)
+	require.NoError(t, s.AddHook(hook, nil))
+
+	require.Equal(t, 3, s.loadClients(v))
+	short, ok := s.Clients.Get("short")
+	require.True(t, ok)
+	require.False(t, short.Closed())
+
+	s.clearExpiredClients(time.Now().Unix() + 2)
+
+	_, ok = s.Clients.Get("short")
+	require.False(t, ok)
+	require.Len(t, hook.expired, 1)
+	require.Equal(t, "short", hook.expired[0].ID)
+	require.True(t, short.Closed()) // WriteLoop ended
+	_, ok = s.Clients.Get("long")
+	require.True(t, ok)
+	_, ok = s.Clients.Get("no-flag")
+	require.True(t, ok)
 	requireInfoCounts(t, s)
 }
 

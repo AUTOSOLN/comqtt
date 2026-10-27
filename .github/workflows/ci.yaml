@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - uses: arduino/setup-task@v3
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Format check
+        run: task fmt:check
+
+      - name: Vet
+        run: task vet
+
+      - name: Build
+        run: task build
+
+      - name: Start test databases
+        run: task deps:up
+
+      - name: Race tests
+        run: task test:race
+
+      - name: Vulnerability check (warning only)
+        run: task vuln
+        continue-on-error: true

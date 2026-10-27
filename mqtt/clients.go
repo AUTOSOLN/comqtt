@@ -359,17 +359,28 @@ func (cl *Client) ClearInflights(now, maximumExpiry int64) []uint16 {
 	return deleted
 }
 
-func (cl *Client) ClearAllInflightsInMemoryOnly() {
+// ClearAllInflightsInMemoryOnly removes all inflights from memory without calling hooks.
+// counted decrements Info.Inflight; pass false if the messages moved to another client.
+// Returns the number of messages removed.
+func (cl *Client) ClearAllInflightsInMemoryOnly(counted bool) int {
+	n := 0
 	for _, tk := range cl.State.Inflight.GetAll(false) {
 		if ok := cl.State.Inflight.Delete(tk.PacketID); ok {
-			atomic.AddInt64(&cl.ops.info.Inflight, -1)
+			n++
+			if counted {
+				atomic.AddInt64(&cl.ops.info.Inflight, -1)
+			}
 		}
 	}
 	for _, tk := range cl.State.InboundInflight.GetAll(false) {
 		if ok := cl.State.InboundInflight.Delete(tk.PacketID); ok {
-			atomic.AddInt64(&cl.ops.info.Inflight, -1)
+			n++
+			if counted {
+				atomic.AddInt64(&cl.ops.info.Inflight, -1)
+			}
 		}
 	}
+	return n
 }
 
 // Read reads incoming packets from the connected client and transforms them into

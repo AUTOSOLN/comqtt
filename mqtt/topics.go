@@ -451,17 +451,43 @@ func (x *TopicsIndex) Unsubscribe(filter, client string) (bool, int) {
 		return false, count
 	}
 
+	var existed bool
 	if shareSub {
 		group, _ := isolateParticle(filter, 1)
+		_, existed = particle.shared.Get(group, client)
 		particle.shared.Delete(group, client)
 		count = particle.shared.Len()
 	} else {
+		_, existed = particle.subscriptions.Get(client)
 		particle.subscriptions.Delete(client)
 		count = particle.subscriptions.Len()
 	}
 
 	x.trim(particle)
-	return true, count
+	return existed, count
+}
+
+// SubscriptionCount returns the number of normal and shared client subscriptions (matching Info.Subscriptions).
+// It walks the whole tree under the root lock, so use it for startup reconciliation, not hot paths.
+func (x *TopicsIndex) SubscriptionCount() int {
+	x.root.Lock()
+	defer x.root.Unlock()
+
+	// the root's shared map is nil and nothing subscribes at the root, so start from its children.
+	n := 0
+	for _, p := range x.root.particles.getAll() {
+		n += countSubscriptions(p)
+	}
+	return n
+}
+
+// countSubscriptions returns the normal and shared subscriptions at p and below.
+func countSubscriptions(p *particle) int {
+	n := p.subscriptions.Len() + p.shared.Len()
+	for _, child := range p.particles.getAll() {
+		n += countSubscriptions(child)
+	}
+	return n
 }
 
 // RetainMessage saves a message payload to the end of a topic address. Returns
@@ -531,7 +557,7 @@ func (x *TopicsIndex) seek(filter string, d int) *particle {
 
 // trim removes empty filter particles from the index.
 func (x *TopicsIndex) trim(n *particle) {
-	for n.parent != nil && n.retainPath == "" && n.particles.len()+n.subscriptions.Len()+n.shared.Len() == 0 {
+	for n.parent != nil && n.retainPath == "" && n.particles.len()+n.subscriptions.Len()+n.shared.Len()+n.inlineSubscriptions.Len() == 0 {
 		key := n.key
 		n = n.parent
 		n.particles.delete(key)

@@ -47,6 +47,10 @@ const (
 	// there's no concurrency concern in setting it — cl is never shared
 	// across connections.
 	ExtAuthDenyCode = "mqtt.auth-deny-code"
+
+	// closeWaitTimeout bounds how long Close waits for client cleanup. Cleanup takes
+	// milliseconds per client; 3s stays well inside Docker's default 10s stop grace period.
+	closeWaitTimeout = 3 * time.Second
 )
 
 var (
@@ -146,6 +150,9 @@ type Server struct {
 	Blacklist      []string             // blacklist of client id
 	TopicToStats   map[string]int64     // $SYS topic to statistics lookup
 	TopicToStatsMu sync.Mutex
+	connMu         sync.Mutex     // guards closing and connWg.Add
+	closing        bool           // set by Close; no new connections are admitted
+	connWg         sync.WaitGroup // tracks connection handlers so Close can wait for their cleanup
 }
 
 // loop contains interval tickers for the system events loop.
@@ -318,6 +325,10 @@ func (s *Server) Serve() error {
 		}
 	}
 
+	// before the event loop and listeners, so handlers can change loaded state
+	// before expiry or a client acts on it.
+	s.hooks.OnStoreLoaded()
+
 	go s.eventLoop()                            // spin up event loop for issuing $SYS values and closing server.
 	s.Listeners.ServeAll(s.EstablishConnection) // start listening on all listeners.
 	s.publishSysTopics()                        // begin publishing $SYS system values.
@@ -352,6 +363,16 @@ func (s *Server) eventLoop() {
 
 // EstablishConnection establishes a new client when a listener accepts a new connection.
 func (s *Server) EstablishConnection(listener string, c net.Conn) error {
+	s.connMu.Lock()
+	if s.closing {
+		s.connMu.Unlock()
+		_ = c.Close()
+		return packets.ErrServerShuttingDown
+	}
+	s.connWg.Add(1)
+	s.connMu.Unlock()
+	defer s.connWg.Done()
+
 	cl := s.NewClient(c, listener, "", false)
 	return s.attachClient(cl, listener)
 }
@@ -520,7 +541,14 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver)                                   // [MQTT-3.1.4-3]
 		if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
 			s.UnsubscribeClient(existing)
-			existing.ClearAllInflightsInMemoryOnly()
+			if pk.Connect.Clean {
+				// the stores delete the rows in OnSessionEstablish
+				dropped := existing.ClearAllInflightsInMemoryOnly(true)
+				atomic.AddInt64(&s.Info.InflightDropped, int64(dropped))
+			} else {
+				// old v3 clean session: OnSessionEstablish can't see it, so drop through OnQosDropped
+				existing.ClearInflights(math.MaxInt64, 0)
+			}
 			atomic.StoreUint32(&existing.State.isTakenOver, 1) // only set isTakenOver after unsubscribe has occurred
 			return false                                       // [MQTT-3.2.2-3]
 		}
@@ -551,7 +579,7 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		// Clean the state of the existing client to prevent sequential take-overs
 		// from increasing memory usage by inflights + subs * client-id.
 		s.UnsubscribeClient(existing)
-		existing.ClearAllInflightsInMemoryOnly()
+		existing.ClearAllInflightsInMemoryOnly(false) // messages moved to cl and are still counted
 
 		s.Log.Debug("session taken over", "client", cl.ID, "old_remote", existing.Net.Remote, "new_remote", cl.Net.Remote)
 
@@ -1165,7 +1193,9 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		// Synchronous write: used during shutdown so the packet reaches the TCP
 		// send buffer before the WriteLoop goroutine is stopped by CloseAll.
 		if err := cl.WritePacket(out); err != nil {
-			cl.State.Inflight.Delete(out.PacketID)
+			if ok := cl.State.Inflight.Delete(out.PacketID); ok {
+				atomic.AddInt64(&s.Info.Inflight, -1)
+			}
 			atomic.AddInt64(&s.Info.InflightDropped, 1)
 			cl.ops.hooks.OnQosDropped(cl, out)
 			cl.State.Inflight.IncreaseSendQuota()
@@ -1182,7 +1212,9 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		cl.ops.hooks.OnPublishDropped(cl, pk)
 
 		// packet was dropped due to irregular circumstances, so rollback inflight.
-		cl.State.Inflight.Delete(out.PacketID)
+		if ok := cl.State.Inflight.Delete(out.PacketID); ok {
+			atomic.AddInt64(&s.Info.Inflight, -1)
+		}
 		atomic.AddInt64(&s.Info.InflightDropped, 1)
 		cl.ops.hooks.OnQosDropped(cl, out)
 
@@ -1646,7 +1678,23 @@ func (s *Server) Close() error {
 		s.sendLWT(cl)
 	}
 
+	s.connMu.Lock()
+	s.closing = true
+	s.connMu.Unlock()
+
 	s.Listeners.CloseAll(s.closeListenerClients)
+
+	waited := make(chan struct{})
+	go func() {
+		s.connWg.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(closeWaitTimeout):
+		s.Log.Warn("timed out waiting for client cleanup", "waited", closeWaitTimeout)
+	}
+
 	s.hooks.OnStopped()
 	s.hooks.Stop()
 
@@ -1716,8 +1764,8 @@ func (s *Server) readStore() error {
 		if err != nil {
 			return fmt.Errorf("failed to load clients; %w", err)
 		}
-		s.loadClients(clients)
-		s.Log.Debug("loaded clients from store", "len", len(clients))
+		restored := s.loadClients(clients)
+		s.Log.Debug("loaded clients from store", "len", restored, "discarded", len(clients)-restored)
 	}
 
 	if s.hooks.Provides(StoredSubscriptions) {
@@ -1774,9 +1822,9 @@ func (s *Server) loadServerInfo(v system.Info) {
 		atomic.StoreInt64(&s.Info.PacketsSent, v.PacketsSent)
 		atomic.StoreInt64(&s.Info.InflightDropped, v.InflightDropped)
 	}
-	atomic.StoreInt64(&s.Info.Retained, v.Retained)
-	atomic.StoreInt64(&s.Info.Inflight, v.Inflight)
-	atomic.StoreInt64(&s.Info.Subscriptions, v.Subscriptions)
+	// Retained, Inflight and Subscriptions are deliberately not restored: the
+	// loaders count them from what was loaded, and the saved values are only as
+	// fresh as the last $SYS tick.
 }
 
 // loadSubscriptions restores subscriptions from the datastore.
@@ -1784,6 +1832,11 @@ func (s *Server) loadSubscriptions(v []storage.Subscription) {
 	for _, sub := range v {
 		//Omit loading inline clients saved in the datastore, given that the broker will load them again anyway, if enabled.
 		if sub.Client == InlineClientId {
+			continue
+		}
+
+		// Refused subscriptions saved by older versions of the storage hooks; never subscribed or counted.
+		if sub.Qos >= packets.ErrUnspecifiedError.Code {
 			continue
 		}
 
@@ -1798,6 +1851,7 @@ func (s *Server) loadSubscriptions(v []storage.Subscription) {
 		// count represents the number of subscribers for the current filter
 		// isNew represents whether to subscribe for the first time
 		if isNew, count := s.Topics.Subscribe(sub.Client, sb); isNew {
+			atomic.AddInt64(&s.Info.Subscriptions, 1) // orphan rows (no stored client) are in the tree, so count them too
 			if cl, ok := s.Clients.Get(sub.Client); ok {
 				cl.State.Subscriptions.Add(sub.Filter, sb)
 				s.hooks.OnSubscribed(cl, packets.Packet{Filters: []packets.Subscription{sb}}, []byte{sub.Qos}, []int{count})
@@ -1806,8 +1860,11 @@ func (s *Server) loadSubscriptions(v []storage.Subscription) {
 	}
 }
 
-// loadClients restores clients from the datastore.
-func (s *Server) loadClients(v []storage.Client) {
+// loadClients restores clients from the datastore. Sessions that should have
+// ended at disconnect (v3 clean session, v5 expiry 0) survive a crash because
+// the disconnect path never ran; those are discarded through OnSessionDiscarded
+// instead.
+func (s *Server) loadClients(v []storage.Client) (restored int) {
 	for _, c := range v {
 		cl := s.NewClient(nil, c.Listener, c.ID, false)
 		cl.Properties.Username = c.Username
@@ -1827,17 +1884,69 @@ func (s *Server) loadClients(v []storage.Client) {
 			MaximumPacketSize:         c.Properties.MaximumPacketSize,
 		}
 		cl.Properties.Will = Will(c.Will)
+
+		// same expression as expire in attachClient's disconnect path
+		if (cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0) || (cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean) {
+			s.Log.Debug("discarding dead session from store", "client", cl.ID, "protocol", cl.Properties.ProtocolVersion)
+			s.hooks.OnSessionDiscarded(cl)
+			cl.Stop(nil) // ends the WriteLoop NewClient started
+			continue
+		}
+
+		// restored sessions are offline from load time; downtime before the
+		// restart doesn't count toward expiry.
+		atomic.StoreInt64(&cl.State.disconnected, time.Now().Unix())
 		s.Clients.Add(cl)
+		restored++
+	}
+
+	return restored
+}
+
+// RemoveClientInMemoryOnly removes an offline client from the server without
+// calling any hooks, so storage is not touched. Its subscriptions and inflights
+// are uncounted and the WriteLoop NewClient started is stopped.
+func (s *Server) RemoveClientInMemoryOnly(cl *Client) {
+	for filter := range cl.State.Subscriptions.GetAll() {
+		cl.State.Subscriptions.Delete(filter)
+		if ok, _ := s.Topics.Unsubscribe(filter, cl.ID); ok {
+			atomic.AddInt64(&s.Info.Subscriptions, -1)
+		}
+	}
+	cl.ClearAllInflightsInMemoryOnly(true)
+	cl.Stop(nil)
+	s.Clients.Delete(cl.ID)
+}
+
+// restoreInflightExpiry sets Expiry on an inflight packet restored from
+// storage, the same way PublishToSubscribers sets it on a new publish.
+func (s *Server) restoreInflightExpiry(pk *packets.Packet) {
+	pk.Expiry = pk.Created + s.Options.Capabilities.MaximumMessageExpiryInterval
+	if pk.Properties.MessageExpiryInterval > 0 {
+		pk.Expiry = pk.Created + int64(pk.Properties.MessageExpiryInterval)
 	}
 }
 
-// loadInflight restores inflight messages from the datastore.
+// loadInflight restores inflight messages from the datastore onto their
+// recipient, msg.ClientID, which the storage hooks fill from their keys.
+// Messages without a known recipient are skipped and logged.
 func (s *Server) loadInflight(v []storage.Message) {
 	for _, msg := range v {
-		if client, ok := s.Clients.Get(msg.Origin); ok {
-			if ok := client.State.Inflight.Set(msg.ToPacket()); ok {
-				atomic.AddInt64(&s.Info.Inflight, 1)
-			}
+		if msg.ClientID == "" {
+			s.Log.Warn("skipping restored inflight message with no recipient", "id", msg.ID, "origin", msg.Origin)
+			continue
+		}
+
+		client, ok := s.Clients.Get(msg.ClientID)
+		if !ok {
+			s.Log.Warn("skipping restored inflight message for unknown client", "id", msg.ID, "client", msg.ClientID)
+			continue
+		}
+
+		pk := msg.ToPacket()
+		s.restoreInflightExpiry(&pk)
+		if ok := client.State.Inflight.Set(pk); ok {
+			atomic.AddInt64(&s.Info.Inflight, 1)
 		}
 	}
 }
@@ -1854,6 +1963,11 @@ func (s *Server) loadSubscriptionsForClient(cl *Client, v []storage.Subscription
 			continue
 		}
 
+		// Refused subscriptions saved by older versions of the storage hooks; never subscribed or counted.
+		if sub.Qos >= packets.ErrUnspecifiedError.Code {
+			continue
+		}
+
 		sb := packets.Subscription{
 			Filter:            sub.Filter,
 			RetainHandling:    sub.RetainHandling,
@@ -1863,23 +1977,21 @@ func (s *Server) loadSubscriptionsForClient(cl *Client, v []storage.Subscription
 			Identifier:        sub.Identifier,
 		}
 		if isNew, count := s.Topics.Subscribe(cl.ID, sb); isNew {
+			atomic.AddInt64(&s.Info.Subscriptions, 1)
 			cl.State.Subscriptions.Add(sub.Filter, sb)
 			s.hooks.OnSubscribed(cl, packets.Packet{Filters: []packets.Subscription{sb}}, []byte{sub.Qos}, []int{count})
 		}
 	}
 }
 
-// loadInflightForClient restores inflight messages queued for a single, known
-// client. Unlike loadInflight (used for the bulk, all-clients restore at
-// startup), the recipient here is cl itself — the caller already knows it
-// from the StoredInflightMessagesByCid(cid) query that produced v — not
-// msg.Origin, which records who originally published the message and is
-// often a different client than the one the message is queued for. cl is
-// passed directly rather than looked up via s.Clients.Get(cid); see
-// loadClientHistory's doc comment for why that lookup would fail here.
+// loadInflightForClient restores v into cl's inflight state. v must already be
+// filtered to cl; msg.ClientID is not checked. cl is passed in because it is
+// not yet in s.Clients (this runs before s.Clients.Add in processConnect).
 func (s *Server) loadInflightForClient(cl *Client, v []storage.Message) {
 	for _, msg := range v {
-		if ok := cl.State.Inflight.Set(msg.ToPacket()); ok {
+		pk := msg.ToPacket()
+		s.restoreInflightExpiry(&pk)
+		if ok := cl.State.Inflight.Set(pk); ok {
 			atomic.AddInt64(&s.Info.Inflight, 1)
 		}
 	}
@@ -1890,6 +2002,7 @@ func (s *Server) loadRetained(v []storage.Message) {
 	for _, msg := range v {
 		s.Topics.RetainMessage(msg.ToPacket())
 	}
+	atomic.StoreInt64(&s.Info.Retained, int64(s.Topics.Retained.Len()))
 }
 
 // clearExpiredClients deletes all clients which have been disconnected for longer
@@ -1908,7 +2021,13 @@ func (s *Server) clearExpiredClients(dt int64) {
 
 		if disconnected+int64(expire) < dt {
 			s.hooks.OnClientExpired(client)
+			// No OnQosDropped: each store's OnClientExpired deletes the rows, so it
+			// would only repeat those deletes. Counted as dropped, like the
+			// zero-expiry path's ClearInflights in the disconnect handler.
+			dropped := client.ClearAllInflightsInMemoryOnly(true)
+			atomic.AddInt64(&s.Info.InflightDropped, int64(dropped))
 			s.UnsubscribeClient(client) // [MQTT-4.1.0-2] clean up topic subscriptions on session expiry
+			client.Stop(nil)            // no-op unless restored; ends the WriteLoop NewClient started
 			s.Clients.Delete(id)        // [MQTT-4.1.0-2]
 		}
 	}
@@ -1922,6 +2041,7 @@ func (s *Server) clearExpiredRetainedMessages(now int64) {
 			s.hooks.OnRetainedExpired(filter)
 		}
 	}
+	atomic.StoreInt64(&s.Info.Retained, int64(s.Topics.Retained.Len()))
 }
 
 // clearExpiredInflights deletes any inflight messages which have expired.

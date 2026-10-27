@@ -6,8 +6,12 @@ package badger
 
 import (
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,6 +79,7 @@ func TestID(t *testing.T) {
 
 func TestProvides(t *testing.T) {
 	h := new(Hook)
+	require.True(t, h.Provides(mqtt.OnSessionEstablish))
 	require.True(t, h.Provides(mqtt.OnSessionEstablished))
 	require.True(t, h.Provides(mqtt.OnDisconnect))
 	require.True(t, h.Provides(mqtt.OnSubscribed))
@@ -84,6 +89,7 @@ func TestProvides(t *testing.T) {
 	require.True(t, h.Provides(mqtt.OnQosComplete))
 	require.True(t, h.Provides(mqtt.OnQosDropped))
 	require.True(t, h.Provides(mqtt.OnSysInfoTick))
+	require.True(t, h.Provides(mqtt.OnSessionDiscarded))
 	require.True(t, h.Provides(mqtt.StoredClients))
 	require.True(t, h.Provides(mqtt.StoredInflightMessages))
 	require.True(t, h.Provides(mqtt.StoredRetainedMessages))
@@ -171,6 +177,66 @@ func TestOnClientExpired(t *testing.T) {
 	require.ErrorIs(t, badgerhold.ErrNotFound, err)
 }
 
+func TestOnClientExpiredDeletesInflights(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	a := &mqtt.Client{ID: "a"}
+	h.OnSessionEstablished(a, packets.Packet{})
+	for i, cl := range []*mqtt.Client{a, a, {ID: "a:b"}, {ID: "zen"}} {
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+	}
+
+	h.OnClientExpired(a)
+
+	r, err := h.StoredInflightMessages()
+	require.NoError(t, err)
+	got := []string{}
+	for _, m := range r {
+		got = append(got, m.ClientID)
+	}
+	require.ElementsMatch(t, []string{"a:b", "zen"}, got)
+
+	err = h.db.Get(clientKey(a), new(storage.Client))
+	require.ErrorIs(t, err, badgerhold.ErrNotFound)
+}
+
+func TestOnSessionEstablishCleanDeletesInflights(t *testing.T) {
+	for _, tc := range []struct {
+		clean bool
+		want  []string
+	}{
+		{clean: true, want: []string{"a:b", "zen"}},
+		{clean: false, want: []string{"a", "a", "a:b", "zen"}},
+	} {
+		t.Run(strconv.FormatBool(tc.clean), func(t *testing.T) {
+			h := new(Hook)
+			h.SetOpts(logger, nil)
+			err := h.Init(nil)
+			require.NoError(t, err)
+			defer teardown(t, h.config.Path, h)
+
+			a := &mqtt.Client{ID: "a"}
+			for i, cl := range []*mqtt.Client{a, a, {ID: "a:b"}, {ID: "zen"}} {
+				h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+			}
+
+			h.OnSessionEstablish(a, packets.Packet{Connect: packets.ConnectParams{Clean: tc.clean}})
+
+			r, err := h.StoredInflightMessages()
+			require.NoError(t, err)
+			got := []string{}
+			for _, m := range r {
+				got = append(got, m.ClientID)
+			}
+			require.ElementsMatch(t, tc.want, got)
+		})
+	}
+}
+
 func TestOnClientExpiredNoDB(t *testing.T) {
 	h := new(Hook)
 	h.SetOpts(logger, nil)
@@ -184,6 +250,45 @@ func TestOnClientExpiredClosedDB(t *testing.T) {
 	require.NoError(t, err)
 	teardown(t, h.config.Path, h)
 	h.OnClientExpired(client)
+}
+
+func TestOnSessionDiscarded(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	a, ab := &mqtt.Client{ID: "a"}, &mqtt.Client{ID: "a:b"}
+	for i, cl := range []*mqtt.Client{a, ab} {
+		h.OnSessionEstablished(cl, packets.Packet{})
+		h.OnSubscribed(cl, packets.Packet{Filters: packets.Subscriptions{{Filter: "x/1"}}}, []byte{0}, []int{1})
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i + 1)}, time.Now().Unix(), 0)
+	}
+
+	h.OnSessionDiscarded(a)
+
+	require.ErrorIs(t, h.db.Get("a", new(storage.Client)), badgerhold.ErrNotFound)
+	subs, err := h.StoredSubscriptionsByCid("a")
+	require.NoError(t, err)
+	require.Empty(t, subs)
+	msgs, err := h.StoredInflightMessagesByCid("a")
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+
+	require.NoError(t, h.db.Get("a:b", new(storage.Client)))
+	subs, err = h.StoredSubscriptionsByCid("a:b")
+	require.NoError(t, err)
+	require.Len(t, subs, 1)
+	msgs, err = h.StoredInflightMessagesByCid("a:b")
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+}
+
+func TestOnSessionDiscardedNoDB(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	h.OnSessionDiscarded(client)
 }
 
 func TestOnSessionEstablishedNoDB(t *testing.T) {
@@ -236,26 +341,43 @@ func TestOnDisconnectClosedDB(t *testing.T) {
 }
 
 func TestOnDisconnectSessionTakenOver(t *testing.T) {
-	h := new(Hook)
-	h.SetOpts(logger, nil)
-	err := h.Init(nil)
-	require.NoError(t, err)
+	for _, tc := range []struct {
+		name    string
+		expire  bool
+		deleted bool // the broker removed the row with DeleteSession before the old copy disconnected
+	}{
+		{name: "keep", expire: false},
+		{name: "expire", expire: true},
+		{name: "deleted keep", expire: false, deleted: true},
+		{name: "deleted expire", expire: true, deleted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := new(Hook)
+			h.SetOpts(logger, nil)
+			err := h.Init(nil)
+			require.NoError(t, err)
+			defer teardown(t, h.config.Path, h)
 
-	testClient := &mqtt.Client{
-		ID: "test",
-		Net: mqtt.ClientConnection{
-			Remote:   "test.addr",
-			Listener: "listener",
-		},
-		Properties: mqtt.ClientProperties{
-			Username: []byte("username"),
-			Clean:    false,
-		},
+			newCl := &mqtt.Client{ID: "test", Net: mqtt.ClientConnection{Remote: "new.addr"}}
+			h.OnSessionEstablished(newCl, packets.Packet{})
+			if tc.deleted {
+				require.NoError(t, h.DeleteSession("test"))
+			}
+
+			oldCl := &mqtt.Client{ID: "test", Net: mqtt.ClientConnection{Remote: "old.addr"}}
+			oldCl.Stop(packets.ErrSessionTakenOver)
+			h.OnDisconnect(oldCl, nil, tc.expire)
+
+			r := new(storage.Client)
+			err = h.db.Get("test", r)
+			if tc.deleted {
+				require.ErrorIs(t, err, badgerhold.ErrNotFound)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, "new.addr", r.Remote)
+		})
 	}
-
-	testClient.Stop(packets.ErrSessionTakenOver)
-	teardown(t, h.config.Path, h)
-	h.OnDisconnect(testClient, nil, true)
 }
 
 func TestOnSubscribedThenOnUnsubscribed(t *testing.T) {
@@ -278,6 +400,69 @@ func TestOnSubscribedThenOnUnsubscribed(t *testing.T) {
 	err = h.db.Get(subscriptionKey(client, pkf.Filters[0].Filter), r)
 	require.Error(t, err)
 	require.Equal(t, badgerhold.ErrNotFound, err)
+}
+
+func TestOnSubscribedSkipsRefusedFilters(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	pk := packets.Packet{Filters: packets.Subscriptions{
+		{Filter: "a/b/c"},
+		{Filter: "d/e/f"},
+		{Filter: "g/h/i"},
+	}}
+	h.OnSubscribed(client, pk, []byte{1, 0x80, 0x87}, []int{1, 0, 0})
+
+	subs, err := h.StoredSubscriptions()
+	require.NoError(t, err)
+	require.Len(t, subs, 1)
+	require.Equal(t, "a/b/c", subs[0].Filter)
+}
+
+func TestDeleteSession(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	a, ab := &mqtt.Client{ID: "a"}, &mqtt.Client{ID: "a:b"}
+	for i, cl := range []*mqtt.Client{a, ab} {
+		h.OnSessionEstablished(cl, packets.Packet{})
+		h.OnSubscribed(cl, packets.Packet{Filters: packets.Subscriptions{{Filter: "x/1"}, {Filter: "x/2"}}}, []byte{0, 0}, []int{1, 1})
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i*2 + 1)}, time.Now().Unix(), 0)
+		h.OnQosPublish(cl, packets.Packet{PacketID: uint16(i*2 + 2)}, time.Now().Unix(), 0)
+	}
+
+	require.NoError(t, h.DeleteSession("a"))
+
+	require.ErrorIs(t, h.db.Get("a", new(storage.Client)), badgerhold.ErrNotFound)
+	subs, err := h.StoredSubscriptionsByCid("a")
+	require.NoError(t, err)
+	require.Empty(t, subs)
+	msgs, err := h.StoredInflightMessagesByCid("a")
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+
+	require.NoError(t, h.db.Get("a:b", new(storage.Client)))
+	subs, err = h.StoredSubscriptionsByCid("a:b")
+	require.NoError(t, err)
+	require.Len(t, subs, 2)
+	msgs, err = h.StoredInflightMessagesByCid("a:b")
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+
+	require.NoError(t, h.DeleteSession("a"))
+	require.NoError(t, h.DeleteSession("never-seen"))
+}
+
+func TestDeleteSessionNoDB(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	require.ErrorIs(t, h.DeleteSession("cl1"), storage.ErrDBFileNotOpen)
 }
 
 func TestOnSubscribedNoDB(t *testing.T) {
@@ -648,6 +833,52 @@ func TestStoredInflightMessagesNoDB(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestStoredInflightMessagesClientID(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	// "a:b" splits at the last ':'; hand-written rows don't parse
+	h.OnQosPublish(&mqtt.Client{ID: "zen"}, packets.Packet{PacketID: 1, Origin: "mochi"}, time.Now().Unix(), 0)
+	h.OnQosPublish(&mqtt.Client{ID: "a:b"}, packets.Packet{PacketID: 2, Origin: "mochi"}, time.Now().Unix(), 0)
+	for _, id := range []string{"i1", storage.InflightKey + "_zen"} {
+		err = h.db.Upsert(id, &storage.Message{ID: id, T: storage.InflightKey})
+		require.NoError(t, err)
+	}
+
+	r, err := h.StoredInflightMessages()
+	require.NoError(t, err)
+	got := map[string]string{}
+	for _, m := range r {
+		got[m.ID] = m.ClientID
+	}
+	require.Equal(t, map[string]string{
+		storage.InflightKey + "_zen:1": "zen",
+		storage.InflightKey + "_a:b:2": "a:b",
+		"i1":                           "",
+		storage.InflightKey + "_zen":   "",
+	}, got)
+}
+
+func TestStoredInflightMessagesClientIDNotStored(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	err = h.db.Upsert("i1", &storage.Message{ID: "i1", T: storage.InflightKey, ClientID: "zen"})
+	require.NoError(t, err)
+
+	var m storage.Message
+	err = h.db.Get("i1", &m)
+	require.NoError(t, err)
+	require.Equal(t, "i1", m.ID)
+	require.Empty(t, m.ClientID)
+}
+
 func TestStoredClientByCid(t *testing.T) {
 	h := new(Hook)
 	h.SetOpts(logger, nil)
@@ -664,6 +895,25 @@ func TestStoredClientByCid(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, client.ID, r.ID)
 	require.Equal(t, client.Net.Remote, r.Remote)
+}
+
+func TestOnSessionEstablishedSavesSessionExpiryFlag(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	cl := &mqtt.Client{ID: "v5", Properties: mqtt.ClientProperties{
+		ProtocolVersion: 5,
+		Props:           packets.Properties{SessionExpiryInterval: 300, SessionExpiryIntervalFlag: true},
+	}}
+	h.OnSessionEstablished(cl, packets.Packet{})
+
+	r, err := h.StoredClientByCid("v5")
+	require.NoError(t, err)
+	require.Equal(t, uint32(300), r.Properties.SessionExpiryInterval)
+	require.True(t, r.Properties.SessionExpiryIntervalFlag)
 }
 
 func TestStoredClientByCidNotFound(t *testing.T) {
@@ -773,6 +1023,28 @@ func TestStoredInflightMessagesByCidNoMatch(t *testing.T) {
 	require.Empty(t, r)
 }
 
+func TestStoredInflightMessagesByCidExactMatch(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(nil)
+	require.NoError(t, err)
+	defer teardown(t, h.config.Path, h)
+
+	// the key prefix for "a" also matches "a:b"
+	h.OnQosPublish(&mqtt.Client{ID: "a"}, packets.Packet{PacketID: 1}, time.Now().Unix(), 0)
+	h.OnQosPublish(&mqtt.Client{ID: "a:b"}, packets.Packet{PacketID: 2}, time.Now().Unix(), 0)
+
+	for cid, want := range map[string]string{
+		"a":   storage.InflightKey + "_a:1",
+		"a:b": storage.InflightKey + "_a:b:2",
+	} {
+		r, err := h.StoredInflightMessagesByCid(cid)
+		require.NoError(t, err)
+		require.Len(t, r, 1, cid)
+		require.Equal(t, want, r[0].ID)
+	}
+}
+
 func TestStoredInflightMessagesByCidNoDB(t *testing.T) {
 	h := new(Hook)
 	h.SetOpts(logger, nil)
@@ -820,6 +1092,88 @@ func TestStoredByCidSurvivesRestart(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
 	require.Equal(t, []byte("queued"), msgs[0].Payload)
+}
+
+// TestServerRestartLoadsStoredState writes rows through the hook the way the server
+// would, then restarts a real server on them, so the hook and the loaders are checked
+// against each other rather than each against a fake.
+func TestServerRestartLoadsStoredState(t *testing.T) {
+	dir := t.TempDir()
+
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	require.NoError(t, h.Init(&Options{Path: dir}))
+
+	now := time.Now().Unix()
+	queue := func(cl *mqtt.Client, id uint16) {
+		h.OnQosPublish(cl, packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: 1},
+			PacketID:    id,
+			TopicName:   "a/allowed",
+			Origin:      "pub",
+			Created:     now,
+		}, now, 0)
+	}
+
+	// a persistent subscriber with one refused filter and two messages queued by pub
+	sub, pub := &mqtt.Client{ID: "sub"}, &mqtt.Client{ID: "pub"}
+	h.OnSessionEstablished(sub, packets.Packet{})
+	h.OnSessionEstablished(pub, packets.Packet{})
+	h.OnSubscribed(sub, packets.Packet{Filters: packets.Subscriptions{
+		{Filter: "a/allowed", Qos: 1},
+		{Filter: "a/denied", Qos: 1},
+	}}, []byte{1, 0x80}, []int{1, 0})
+	queue(sub, 1)
+	queue(sub, 2)
+
+	// a session that expired with a message queued
+	expired := &mqtt.Client{ID: "expired"}
+	h.OnSessionEstablished(expired, packets.Packet{})
+	queue(expired, 1)
+	h.OnClientExpired(expired)
+
+	// a session that reconnected with clean start, discarding its queued message
+	clean := &mqtt.Client{ID: "clean"}
+	h.OnSessionEstablished(clean, packets.Packet{})
+	queue(clean, 1)
+	h.OnSessionEstablish(clean, packets.Packet{Connect: packets.ConnectParams{Clean: true}})
+	h.OnSessionEstablished(clean, packets.Packet{})
+
+	// a v3 clean session left behind by a crash, discarded at load
+	dead := &mqtt.Client{ID: "dead", Properties: mqtt.ClientProperties{ProtocolVersion: 4, Clean: true}}
+	h.OnSessionEstablished(dead, packets.Packet{})
+	h.OnSubscribed(dead, packets.Packet{Filters: packets.Subscriptions{{Filter: "a/dead", Qos: 1}}}, []byte{1}, []int{1})
+	queue(dead, 1)
+
+	h.OnSysInfoTick(&system.Info{Subscriptions: 99, Inflight: 99}) // stale saved counts
+	require.NoError(t, h.Stop())
+
+	s := mqtt.New(&mqtt.Options{Logger: logger})
+	require.NoError(t, s.AddHook(new(Hook), &Options{Path: dir}))
+	require.NoError(t, s.Serve())
+	defer s.Close()
+
+	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.Subscriptions))
+	require.Equal(t, int64(2), atomic.LoadInt64(&s.Info.Inflight))
+
+	cl, ok := s.Clients.Get("sub")
+	require.True(t, ok)
+	require.Equal(t, []string{"a/allowed"}, slices.Collect(maps.Keys(cl.State.Subscriptions.GetAll())))
+	require.Equal(t, 2, cl.State.Inflight.Len())
+
+	cl, ok = s.Clients.Get("pub")
+	require.True(t, ok)
+	require.Equal(t, 0, cl.State.Inflight.Len())
+
+	_, ok = s.Clients.Get("expired")
+	require.False(t, ok)
+
+	cl, ok = s.Clients.Get("clean")
+	require.True(t, ok)
+	require.Equal(t, 0, cl.State.Inflight.Len())
+
+	_, ok = s.Clients.Get("dead")
+	require.False(t, ok)
 }
 
 func TestStoredSysInfo(t *testing.T) {

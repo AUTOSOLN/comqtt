@@ -1,5 +1,19 @@
-bolt.db
+*.db
 /dump.rdb
-raft.db
 .idea
 .vscode
+
+# Local utility files
+.local/*
+
+# Logs
+**/*.log
+
+# Local Agent configs
+.claude/**/*.local.*
+
+# Team member specific commands
+.claude/**/ami-*.md
+
+# Local Taskfile (use Taskfile.dist.yml for shared)
+Taskfile.yml

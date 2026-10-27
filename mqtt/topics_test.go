@@ -1017,6 +1017,21 @@ func TestInlineSubscribe(t *testing.T) {
 	require.NotNil(t, final)
 }
 
+// A client unsubscribing from the same filter as an inline subscription must
+// not trim the particle the inline subscription lives on.
+func TestUnsubscribeKeepsInlineSubscription(t *testing.T) {
+	index := NewTopicsIndex()
+	index.InlineSubscribe(InlineSubscription{
+		Handler:      func(*Client, packets.Subscription, packets.Packet) {},
+		Subscription: packets.Subscription{Filter: "a/#", Identifier: 1},
+	})
+	index.Subscribe("cl1", packets.Subscription{Filter: "a/#"})
+
+	removed, _ := index.Unsubscribe("a/#", "cl1")
+	require.True(t, removed)
+	require.Len(t, index.Subscribers("a/b").InlineSubscriptions, 1)
+}
+
 func TestInlineUnsubscribe(t *testing.T) {
 	handler := func(cl *Client, sub packets.Subscription, pk packets.Packet) {
 		// handler logic

@@ -431,6 +431,11 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 
 	err = cl.Read(s.receivePacket)
 	if err != nil {
+		// An inbound packet over the server's Maximum Packet Size is rejected in ReadFixedHeader,
+		// before any handler runs, so tell an MQTT 5 client why it is being closed.
+		if errors.Is(err, packets.ErrPacketTooLarge) && cl.Properties.ProtocolVersion == 5 && !cl.Closed() {
+			_ = s.DisconnectClient(cl, packets.ErrPacketTooLarge) // MQTT 5 §3.2.2.3.6, [MQTT-4.13.1-1]
+		}
 		s.sendLWT(cl)
 		cl.Stop(err)
 	} else {
@@ -611,6 +616,10 @@ func (s *Server) SendConnack(cl *Client, reason packets.Code, present bool, prop
 	if s.Options.Capabilities.MaximumQos < 2 {
 		properties.MaximumQos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9]
 		properties.MaximumQosFlag = true
+	}
+
+	if s.Options.Capabilities.MaximumPacketSize > 0 {
+		properties.MaximumPacketSize = s.Options.Capabilities.MaximumPacketSize // 3.2.2.3.6 Maximum Packet Size
 	}
 
 	if cl.Properties.Props.AssignedClientID != "" {

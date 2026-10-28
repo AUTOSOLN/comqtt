@@ -472,6 +472,51 @@ func TestEstablishConnectionReadError(t *testing.T) {
 	_ = r.Close()
 }
 
+func TestEstablishConnectionPacketTooLarge(t *testing.T) {
+	s := newServer()
+	s.Options.Capabilities.MaximumPacketSize = 128
+	defer s.Close()
+
+	r, w := net.Pipe()
+	o := make(chan error)
+	go func() {
+		o <- s.EstablishConnection("tcp", r)
+	}()
+
+	go func() {
+		_, _ = w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt5).RawBytes)
+		publish := []byte{
+			packets.Publish << 4, 0x80, 0x01, // Fixed header, Remaining Length 128: 131 bytes in all
+			0, 5, 'a', '/', 'b', '/', 'c', // Topic Name
+			0, // Properties length
+		}
+		_, _ = w.Write(append(publish, make([]byte, 120)...)) // Payload
+	}()
+
+	recv := make(chan []byte)
+	go func() {
+		buf, err := io.ReadAll(w)
+		require.NoError(t, err)
+		recv <- buf
+	}()
+
+	err := <-o
+	require.ErrorIs(t, err, packets.ErrPacketTooLarge)
+
+	disconnect := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: 5,
+		ReasonCode:      packets.ErrPacketTooLarge.Code,
+		Properties:      packets.Properties{ReasonString: packets.ErrPacketTooLarge.Reason},
+	}
+	want := new(bytes.Buffer)
+	require.NoError(t, disconnect.DisconnectEncode(want))
+	require.True(t, bytes.HasSuffix(<-recv, want.Bytes()), "DISCONNECT 0x95 after an oversize packet")
+
+	_ = w.Close()
+	_ = r.Close()
+}
+
 func TestEstablishConnectionInheritExisting(t *testing.T) {
 	s := newServer()
 	defer s.Close()
@@ -1016,6 +1061,25 @@ func TestServerValidateConnect(t *testing.T) {
 			require.ErrorIs(t, err, tx.expect)
 		})
 	}
+}
+
+func TestServerSendConnackMaximumPacketSize(t *testing.T) {
+	s := newServer()
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	s.Options.Capabilities.MaximumPacketSize = 4096
+	go func() {
+		err := s.SendConnack(cl, packets.CodeSuccess, false, nil)
+		require.NoError(t, err)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	pk := packets.Packet{ProtocolVersion: 5}
+	require.NoError(t, pk.FixedHeader.Decode(buf[0]))
+	require.NoError(t, pk.ConnackDecode(buf[2:]))
+	require.Equal(t, uint32(4096), pk.Properties.MaximumPacketSize)
 }
 
 func TestServerSendConnackAdjustedExpiryInterval(t *testing.T) {

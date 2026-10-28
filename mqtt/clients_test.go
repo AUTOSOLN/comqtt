@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -414,6 +415,24 @@ func TestClientReadFixedHeaderPacketSizeIncludesLengthBytes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClientReadFixedHeaderPacketOversizedLogged(t *testing.T) {
+	cl, r, _ := newTestClient()
+	log, out := newLogCapture()
+	cl.ops.log = log
+	cl.ops.options.Capabilities.MaximumPacketSize = 2
+	defer cl.Stop(errClientStop)
+
+	raw := packets.TPacketData[packets.Publish].Get(packets.TPublishQos1Dup).RawBytes
+	go func() {
+		_, _ = r.Write(raw)
+		_ = r.Close()
+	}()
+
+	fh := new(packets.FixedHeader)
+	require.ErrorIs(t, cl.ReadFixedHeader(fh), packets.ErrPacketTooLarge)
+	require.Contains(t, out.String(), `limit=maximum-packet-size limit_value=2 value=`+strconv.Itoa(len(raw))+` action="connection closed"`)
 }
 
 func TestClientReadFixedHeaderReadEOF(t *testing.T) {

@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -458,6 +459,7 @@ func (cl *Client) ReadFixedHeader(fh *packets.FixedHeader) error {
 
 	// The whole packet is the fixed header byte, the bu Remaining Length bytes and the Remaining Length.
 	if cl.ops.options.Capabilities.MaximumPacketSize > 0 && uint32(fh.Remaining+1+bu) > cl.ops.options.Capabilities.MaximumPacketSize {
+		logLimitExceeded(cl.ops.log, slog.LevelWarn, cl, "maximum-packet-size", cl.ops.options.Capabilities.MaximumPacketSize, fh.Remaining+1+bu, "connection closed")
 		return packets.ErrPacketTooLarge // [MQTT-3.2.2-15]
 	}
 

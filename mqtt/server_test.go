@@ -1144,6 +1144,158 @@ func TestServerSendConnackRetainNotAvailable(t *testing.T) {
 	require.Equal(t, byte(0), pk.Properties.RetainAvailable)
 }
 
+// logCapture is a logger whose output a test can read back, safe across the
+// client's write goroutine.
+type logCapture struct {
+	sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *logCapture) Write(p []byte) (int, error) {
+	l.Lock()
+	defer l.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *logCapture) String() string {
+	l.Lock()
+	defer l.Unlock()
+	return l.buf.String()
+}
+
+func newLogCapture() (*slog.Logger, *logCapture) {
+	l := new(logCapture)
+	return slog.New(slog.NewTextHandler(l, &slog.HandlerOptions{Level: slog.LevelDebug})), l
+}
+
+func TestLogLimitExceeded(t *testing.T) {
+	log, out := newLogCapture()
+	cl, _, _ := newTestClient()
+	cl.Net.Remote = "10.0.0.1:5555"
+	cl.Net.Listener = "t1"
+
+	logLimitExceeded(log, slog.LevelWarn, cl, "maximum-qos", byte(1), byte(2), "connection closed")
+	line := out.String()
+	require.Contains(t, line, "level=WARN")
+	require.Contains(t, line, `msg="client exceeded server limit"`)
+	require.Contains(t, line, "client=mochi remote=10.0.0.1:5555 listener=t1")
+	require.Contains(t, line, `limit=maximum-qos limit_value=1 value=2 action="connection closed"`)
+}
+
+func TestServerLogsLimitExceeded(t *testing.T) {
+	tt := []struct {
+		desc string
+		run  func(s *Server, cl *Client)
+		want string
+	}{
+		{
+			desc: "will qos",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.MaximumQos = 1
+				cl.Properties.Will.Qos = 2
+				_ = s.validateConnect(cl, *packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt5).Packet)
+			},
+			want: `level=WARN msg="client exceeded server limit" client=mochi remote=pipe listener="" limit=maximum-qos limit_value=1 value=2 action="will refused"`,
+		},
+		{
+			desc: "will retain",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.RetainAvailable = 0
+				cl.Properties.Will.Retain = true
+				_ = s.validateConnect(cl, *packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt5).Packet)
+			},
+			want: `limit=retain-available limit_value=0 value=1 action="will refused"`,
+		},
+		{
+			desc: "publish qos",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.MaximumQos = 0
+				cl.Properties.ProtocolVersion = 5
+				_ = s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet)
+			},
+			want: `limit=maximum-qos limit_value=0 value=1 action="connection closed"`,
+		},
+		{
+			desc: "publish retain mqtt5",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.RetainAvailable = 0
+				cl.Properties.ProtocolVersion = 5
+				_ = s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishRetainMqtt5).Packet)
+			},
+			want: `limit=retain-available limit_value=0 value=1 action="connection closed"`,
+		},
+		{
+			desc: "publish retain mqtt3",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.RetainAvailable = 0
+				cl.Properties.ProtocolVersion = 4
+				_ = s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishRetain).Packet)
+			},
+			want: `limit=retain-available limit_value=0 value=1 action="not retained"`,
+		},
+		{
+			desc: "receive maximum",
+			run: func(s *Server, cl *Client) {
+				cl.Properties.ProtocolVersion = 5
+				cl.State.Inflight.ResetReceiveQuota(0)
+				_ = s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet)
+			},
+			want: `limit=receive-maximum limit_value=0 value=1 action="connection closed"`,
+		},
+		{
+			desc: "message expiry",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.MaximumMessageExpiryInterval = 2
+				cl.Properties.ProtocolVersion = 5
+				pk := *packets.TPacketData[packets.Publish].Get(packets.TPublishBasicMqtt5).Packet
+				pk.Properties.MessageExpiryInterval = 3600
+				_ = s.processPacket(cl, pk)
+			},
+			want: `level=DEBUG msg="client exceeded server limit" client=mochi remote=pipe listener="" limit=maximum-message-expiry-interval limit_value=2 value=3600 action=capped`,
+		},
+		{
+			desc: "session expiry",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.MaximumSessionExpiryInterval = 120
+				cl.Properties.ProtocolVersion = 5
+				cl.Properties.Props.SessionExpiryInterval = 300
+				_ = s.SendConnack(cl, packets.CodeSuccess, false, nil)
+			},
+			want: `level=INFO msg="client exceeded server limit" client=mochi remote=pipe listener="" limit=maximum-session-expiry-interval limit_value=120 value=300 action=capped`,
+		},
+		{
+			desc: "pending writes",
+			run: func(s *Server, _ *Client) {
+				_, w := net.Pipe()
+				cl := newClient(w, &ops{ // no write loop, so the outbound queue stays full
+					info:    new(system.Info),
+					hooks:   new(Hooks),
+					log:     logger,
+					options: &Options{Capabilities: &Capabilities{MaximumClientWritesPending: 3}},
+				})
+				for len(cl.State.outbound) < cap(cl.State.outbound) {
+					cl.State.outbound <- new(packets.Packet)
+				}
+				_, _ = s.publishToClient(cl, packets.Subscription{Filter: "a/b/c"}, packets.Packet{}, false)
+			},
+			want: `limit=maximum-client-writes-pending limit_value=3 value=4 action="message dropped"`,
+		},
+	}
+
+	for _, tx := range tt {
+		t.Run(tx.desc, func(t *testing.T) {
+			s := newServer()
+			log, out := newLogCapture()
+			s.Log = log
+			cl, r, _ := newTestClient()
+			go func() { _, _ = io.Copy(io.Discard, r) }()
+
+			tx.run(s, cl)
+			require.Contains(t, out.String(), tx.want)
+		})
+	}
+}
+
 func TestServerSendConnackAdjustedExpiryInterval(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()

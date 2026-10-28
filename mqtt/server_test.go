@@ -759,7 +759,7 @@ func TestEstablishConnectionInheritExistingClean(t *testing.T) {
 	require.ErrorIs(t, retrievedCl.StopCause(), packets.CodeDisconnect) // true error is disconnect
 
 	require.Equal(t, packets.TPacketData[packets.Connack].Get(packets.TConnackAcceptedNoSession).RawBytes, <-recv)
-	require.Equal(t, packets.TPacketData[packets.Disconnect].Get(packets.TDisconnect).RawBytes, <-takeover)
+	require.Empty(t, <-takeover) // a 3.1.1 session taken over is closed without DISCONNECT
 
 	_ = w.Close()
 	_ = r.Close()
@@ -3176,16 +3176,51 @@ func TestServerRecievePacketDisconnectClientZeroNonZero(t *testing.T) {
 func TestServerRecievePacketDisconnectClient(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
 
+	errc := make(chan error, 1)
 	go func() {
-		err := s.DisconnectClient(cl, packets.CodeDisconnect)
-		require.NoError(t, err)
-		_ = w.Close()
+		defer func() { _ = w.Close() }()
+		errc <- s.DisconnectClient(cl, packets.ErrSessionTakenOver)
 	}()
 
 	buf, err := io.ReadAll(r)
 	require.NoError(t, err)
-	require.Equal(t, packets.TPacketData[packets.Disconnect].Get(packets.TDisconnect).RawBytes, buf)
+	require.ErrorIs(t, <-errc, packets.ErrSessionTakenOver)
+	disconnect := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: 5,
+		ReasonCode:      packets.ErrSessionTakenOver.Code,
+		Properties:      packets.Properties{ReasonString: packets.ErrSessionTakenOver.Reason},
+	}
+	want := new(bytes.Buffer)
+	require.NoError(t, disconnect.DisconnectEncode(want))
+	require.Equal(t, want.Bytes(), buf)
+	require.True(t, cl.Closed())
+}
+
+func TestServerDisconnectClientMqtt3ClosesWithoutPacket(t *testing.T) {
+	for _, version := range []byte{3, 4} {
+		t.Run(strconv.Itoa(int(version)), func(t *testing.T) {
+			s := newServer()
+			s.Options.Capabilities.Compatibilities.PassiveClientDisconnect = true // a 3.x client is closed regardless
+			cl, r, w := newTestClient()
+			cl.Properties.ProtocolVersion = version
+
+			errc := make(chan error, 1)
+			go func() {
+				defer func() { _ = w.Close() }()
+				errc <- s.DisconnectClient(cl, packets.ErrSessionTakenOver)
+			}()
+
+			buf, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.ErrorIs(t, <-errc, packets.ErrSessionTakenOver) // the pipe closes before Stop marks the client closed
+			require.Empty(t, buf)
+			require.True(t, cl.Closed())
+			require.ErrorIs(t, cl.StopCause(), packets.ErrSessionTakenOver)
+		})
+	}
 }
 
 func TestServerProcessPacketDisconnect(t *testing.T) {

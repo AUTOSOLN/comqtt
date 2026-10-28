@@ -517,6 +517,66 @@ func TestEstablishConnectionPacketTooLarge(t *testing.T) {
 	_ = r.Close()
 }
 
+// Over TCP, closing a connection with unread input resets it, and a reset can
+// discard the DISCONNECT 0x95 before the client reads it. A client that writes a
+// whole oversize packet before reading must still get the DISCONNECT.
+func TestEstablishConnectionPacketTooLargeTCP(t *testing.T) {
+	s := newServer()
+	s.Options.Capabilities.MaximumPacketSize = 1024
+	defer s.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			_ = s.EstablishConnection("tcp", c)
+		}
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	_, err = conn.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt5).RawBytes)
+	require.NoError(t, err)
+	connack := make([]byte, 2)
+	_, err = io.ReadFull(conn, connack)
+	require.NoError(t, err)
+	_, err = io.ReadFull(conn, make([]byte, connack[1]))
+	require.NoError(t, err)
+
+	payload := 4 << 20
+	remaining := 2 + 5 + 1 + payload // topic, properties length, payload
+	publish := []byte{packets.Publish << 4}
+	for x := remaining; ; {
+		b := byte(x % 128)
+		if x /= 128; x > 0 {
+			publish = append(publish, b|0x80)
+			continue
+		}
+		publish = append(publish, b)
+		break
+	}
+	publish = append(publish, 0, 5, 'a', '/', 'b', '/', 'c', 0)
+	_, err = conn.Write(append(publish, make([]byte, payload)...))
+	require.NoError(t, err, "the server reset the connection while the client was still sending")
+
+	buf, err := io.ReadAll(conn)
+	require.NoError(t, err)
+	disconnect := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: 5,
+		ReasonCode:      packets.ErrPacketTooLarge.Code,
+		Properties:      packets.Properties{ReasonString: packets.ErrPacketTooLarge.Reason},
+	}
+	want := new(bytes.Buffer)
+	require.NoError(t, disconnect.DisconnectEncode(want))
+	require.Equal(t, want.Bytes(), buf)
+}
+
 func TestEstablishConnectionInheritExisting(t *testing.T) {
 	s := newServer()
 	defer s.Close()

@@ -435,6 +435,31 @@ func TestClientReadFixedHeaderPacketOversizedLogged(t *testing.T) {
 	require.Contains(t, out.String(), `limit=maximum-packet-size limit_value=2 value=`+strconv.Itoa(len(raw))+` action="connection closed"`)
 }
 
+func TestClientDiscardPacket(t *testing.T) {
+	cl, r, _ := newTestClient()
+	defer cl.Stop(errClientStop)
+
+	go func() {
+		_, _ = r.Write([]byte{1, 2, 3, 4, 5, 6})
+	}()
+
+	cl.discardPacket(4)
+	b, err := cl.Net.bconn.ReadByte()
+	require.NoError(t, err)
+	require.Equal(t, byte(5), b) // only the packet's own bytes are dropped
+}
+
+func TestClientDiscardPacketTimeout(t *testing.T) {
+	defer func(d time.Duration) { oversizeDiscardTimeout = d }(oversizeDiscardTimeout)
+	oversizeDiscardTimeout = 50 * time.Millisecond
+	cl, _, _ := newTestClient()
+	defer cl.Stop(errClientStop)
+
+	start := time.Now()
+	cl.discardPacket(1 << 20) // the client never sends it
+	require.Less(t, time.Since(start), time.Second)
+}
+
 func TestClientReadFixedHeaderReadEOF(t *testing.T) {
 	cl, r, _ := newTestClient()
 	defer cl.Stop(errClientStop)

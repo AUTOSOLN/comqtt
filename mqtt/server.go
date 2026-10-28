@@ -876,9 +876,10 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 		return s.DisconnectClient(cl, packets.ErrReceiveMaximum) // ~[MQTT-3.3.4-7] ~[MQTT-3.3.4-8]
 	}
 
-	// An MQTT 5 client was told the server's Maximum QoS in CONNACK, so a PUBLISH over it is
-	// refused. Older clients can't know the limit and keep the downgrade below.
-	if !cl.Net.Inline && cl.Properties.ProtocolVersion == 5 && pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
+	// A PUBLISH over the server's Maximum QoS is refused: MQTT 5 clients get DISCONNECT 0x9B, and a 3.x
+	// client is dropped, since acknowledging a lower QoS would break its QoS 2 flow. Only the inline
+	// client is downgraded below.
+	if !cl.Net.Inline && pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
 		return s.DisconnectClient(cl, packets.ErrQosNotSupported) // MQTT 5 §3.2.2.3.4
 	}
 
@@ -925,7 +926,7 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	}
 
 	if pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
-		pk.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9] Reduce qos based on server max qos capability
+		pk.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9] Reduce the inline client's qos to the server max qos capability
 	}
 
 	pkx, err := s.hooks.OnPublish(cl, pk)

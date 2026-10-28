@@ -1825,20 +1825,36 @@ func TestServerProcessPacketPublishQos2(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Pubrec].Get(packets.TPubrec).RawBytes, buf)
 }
 
-func TestServerProcessPacketPublishDowngradeQos(t *testing.T) {
-	s := newServer()
+func TestServerProcessPacketPublishQosNotSupportedMqtt3(t *testing.T) {
+	for _, version := range []byte{3, 4} {
+		t.Run(strconv.Itoa(int(version)), func(t *testing.T) {
+			s := newServer()
+			s.Options.Capabilities.MaximumQos = 1
+			cl, r, w := newTestClient()
+			cl.Properties.ProtocolVersion = version
+
+			errc := make(chan error, 1)
+			go func() {
+				defer func() { _ = w.Close() }()
+				errc <- s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos2).Packet)
+			}()
+
+			buf, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.ErrorIs(t, <-errc, packets.ErrQosNotSupported)
+			require.Empty(t, buf) // dropped, not PUBACKed at a lower QoS
+			require.True(t, cl.Closed())
+			require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+		})
+	}
+}
+
+func TestServerPublishInlineDowngradeQos(t *testing.T) {
+	s := newServerWithInlineClient()
 	s.Options.Capabilities.MaximumQos = 1
-	cl, r, w := newTestClient()
 
-	go func() {
-		err := s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos2).Packet)
-		require.NoError(t, err)
-		_ = w.Close()
-	}()
-
-	buf, err := io.ReadAll(r)
-	require.NoError(t, err)
-	require.Equal(t, packets.TPacketData[packets.Puback].Get(packets.TPuback).RawBytes, buf)
+	require.NoError(t, s.Publish("a/b/c", []byte("hello"), false, 2))
+	require.False(t, s.inlineClient.Closed())
 }
 
 func TestServerProcessPacketPublishQosNotSupportedMqtt5(t *testing.T) {

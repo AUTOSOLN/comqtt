@@ -1821,6 +1821,32 @@ func TestServerProcessPacketPublishDowngradeQos(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Puback].Get(packets.TPuback).RawBytes, buf)
 }
 
+func TestServerProcessPacketPublishQosNotSupportedMqtt5(t *testing.T) {
+	s := newServer()
+	s.Options.Capabilities.MaximumQos = 1
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+
+	go func() {
+		defer func() { _ = w.Close() }()
+		err := s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos2).Packet)
+		require.ErrorIs(t, err, packets.ErrQosNotSupported)
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	disconnect := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: 5,
+		ReasonCode:      packets.ErrQosNotSupported.Code,
+		Properties:      packets.Properties{ReasonString: packets.ErrQosNotSupported.Reason},
+	}
+	want := new(bytes.Buffer)
+	require.NoError(t, disconnect.DisconnectEncode(want))
+	require.Equal(t, want.Bytes(), buf)
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+}
+
 func TestPublishToSubscribersSelfNoLocal(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()

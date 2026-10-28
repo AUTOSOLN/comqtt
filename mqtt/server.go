@@ -871,6 +871,12 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 		return s.DisconnectClient(cl, packets.ErrReceiveMaximum) // ~[MQTT-3.3.4-7] ~[MQTT-3.3.4-8]
 	}
 
+	// An MQTT 5 client was told the server's Maximum QoS in CONNACK, so a PUBLISH over it is
+	// refused. Older clients can't know the limit and keep the downgrade below.
+	if !cl.Net.Inline && cl.Properties.ProtocolVersion == 5 && pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
+		return s.DisconnectClient(cl, packets.ErrQosNotSupported) // MQTT 5 §3.2.2.3.4
+	}
+
 	if !cl.Net.Inline && !s.hooks.OnACLCheck(cl, pk.TopicName, true) {
 		if pk.FixedHeader.Qos == 0 {
 			return nil

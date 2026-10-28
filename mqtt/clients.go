@@ -8,8 +8,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -24,6 +26,9 @@ const (
 	defaultKeepalive             uint16 = 10 // the default connection keepalive value in seconds
 	defaultClientProtocolVersion byte   = 4  // the default mqtt protocol version of connecting clients (if somehow unspecified).
 )
+
+// oversizeDiscardTimeout is how long to spend reading and dropping an oversize packet before the close.
+var oversizeDiscardTimeout = 2 * time.Second
 
 // Client session inheritance way
 const (
@@ -385,6 +390,9 @@ func (cl *Client) Read(packetHandler ReadFn) error {
 		cl.refreshDeadline(cl.State.Keepalive)
 		fh := new(packets.FixedHeader)
 		err = cl.ReadFixedHeader(fh)
+		if errors.Is(err, packets.ErrPacketTooLarge) {
+			cl.discardPacket(fh.Remaining)
+		}
 		if err != nil {
 			return err
 		}
@@ -399,6 +407,19 @@ func (cl *Client) Read(packetHandler ReadFn) error {
 			return err
 		}
 	}
+}
+
+// discardPacket reads and drops up to n bytes, the rest of a packet that won't be processed,
+// for at most oversizeDiscardTimeout. Over TCP, closing a connection with unread input resets
+// it, and the reset can discard the DISCONNECT sent just before the close: a client still
+// writing the packet would never read it.
+func (cl *Client) discardPacket(n int) {
+	if cl.Net.Conn == nil || cl.Net.bconn == nil {
+		return
+	}
+
+	_ = cl.Net.Conn.SetReadDeadline(time.Now().Add(oversizeDiscardTimeout))
+	_, _ = io.CopyN(io.Discard, cl.Net.bconn, int64(n))
 }
 
 // Stop instructs the client to shut down all processing goroutines and disconnect.
@@ -456,7 +477,9 @@ func (cl *Client) ReadFixedHeader(fh *packets.FixedHeader) error {
 		return err
 	}
 
-	if cl.ops.options.Capabilities.MaximumPacketSize > 0 && uint32(fh.Remaining+1) > cl.ops.options.Capabilities.MaximumPacketSize {
+	// The whole packet is the fixed header byte, the bu Remaining Length bytes and the Remaining Length.
+	if cl.ops.options.Capabilities.MaximumPacketSize > 0 && uint32(fh.Remaining+1+bu) > cl.ops.options.Capabilities.MaximumPacketSize {
+		logLimitExceeded(cl.ops.log, slog.LevelWarn, cl, "maximum-packet-size", cl.ops.options.Capabilities.MaximumPacketSize, fh.Remaining+1+bu, "connection closed")
 		return packets.ErrPacketTooLarge // [MQTT-3.2.2-15]
 	}
 

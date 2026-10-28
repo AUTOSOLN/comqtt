@@ -472,6 +472,111 @@ func TestEstablishConnectionReadError(t *testing.T) {
 	_ = r.Close()
 }
 
+func TestEstablishConnectionPacketTooLarge(t *testing.T) {
+	s := newServer()
+	s.Options.Capabilities.MaximumPacketSize = 128
+	defer s.Close()
+
+	r, w := net.Pipe()
+	o := make(chan error)
+	go func() {
+		o <- s.EstablishConnection("tcp", r)
+	}()
+
+	go func() {
+		_, _ = w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt5).RawBytes)
+		publish := []byte{
+			packets.Publish << 4, 0x80, 0x01, // Fixed header, Remaining Length 128: 131 bytes in all
+			0, 5, 'a', '/', 'b', '/', 'c', // Topic Name
+			0, // Properties length
+		}
+		_, _ = w.Write(append(publish, make([]byte, 120)...)) // Payload
+	}()
+
+	recv := make(chan []byte)
+	go func() {
+		buf, err := io.ReadAll(w)
+		require.NoError(t, err)
+		recv <- buf
+	}()
+
+	err := <-o
+	require.ErrorIs(t, err, packets.ErrPacketTooLarge)
+
+	disconnect := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: 5,
+		ReasonCode:      packets.ErrPacketTooLarge.Code,
+		Properties:      packets.Properties{ReasonString: packets.ErrPacketTooLarge.Reason},
+	}
+	want := new(bytes.Buffer)
+	require.NoError(t, disconnect.DisconnectEncode(want))
+	require.True(t, bytes.HasSuffix(<-recv, want.Bytes()), "DISCONNECT 0x95 after an oversize packet")
+
+	_ = w.Close()
+	_ = r.Close()
+}
+
+// Over TCP, closing a connection with unread input resets it, and a reset can
+// discard the DISCONNECT 0x95 before the client reads it. A client that writes a
+// whole oversize packet before reading must still get the DISCONNECT.
+func TestEstablishConnectionPacketTooLargeTCP(t *testing.T) {
+	s := newServer()
+	s.Options.Capabilities.MaximumPacketSize = 1024
+	defer s.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			_ = s.EstablishConnection("tcp", c)
+		}
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+
+	_, err = conn.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt5).RawBytes)
+	require.NoError(t, err)
+	connack := make([]byte, 2)
+	_, err = io.ReadFull(conn, connack)
+	require.NoError(t, err)
+	_, err = io.ReadFull(conn, make([]byte, connack[1]))
+	require.NoError(t, err)
+
+	payload := 4 << 20
+	remaining := 2 + 5 + 1 + payload // topic, properties length, payload
+	publish := []byte{packets.Publish << 4}
+	for x := remaining; ; {
+		b := byte(x % 128)
+		if x /= 128; x > 0 {
+			publish = append(publish, b|0x80)
+			continue
+		}
+		publish = append(publish, b)
+		break
+	}
+	publish = append(publish, 0, 5, 'a', '/', 'b', '/', 'c', 0)
+	_, err = conn.Write(append(publish, make([]byte, payload)...))
+	require.NoError(t, err, "the server reset the connection while the client was still sending")
+
+	buf, err := io.ReadAll(conn)
+	require.NoError(t, err)
+	disconnect := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: 5,
+		ReasonCode:      packets.ErrPacketTooLarge.Code,
+		Properties:      packets.Properties{ReasonString: packets.ErrPacketTooLarge.Reason},
+	}
+	want := new(bytes.Buffer)
+	require.NoError(t, disconnect.DisconnectEncode(want))
+	require.Equal(t, want.Bytes(), buf)
+}
+
 func TestEstablishConnectionInheritExisting(t *testing.T) {
 	s := newServer()
 	defer s.Close()
@@ -714,7 +819,7 @@ func TestEstablishConnectionInheritExistingClean(t *testing.T) {
 	require.ErrorIs(t, retrievedCl.StopCause(), packets.CodeDisconnect) // true error is disconnect
 
 	require.Equal(t, packets.TPacketData[packets.Connack].Get(packets.TConnackAcceptedNoSession).RawBytes, <-recv)
-	require.Equal(t, packets.TPacketData[packets.Disconnect].Get(packets.TDisconnect).RawBytes, <-takeover)
+	require.Empty(t, <-takeover) // a 3.1.1 session taken over is closed without DISCONNECT
 
 	_ = w.Close()
 	_ = r.Close()
@@ -807,7 +912,7 @@ func TestServerEstablishConnectionInvalidConnect(t *testing.T) {
 	err := <-o
 	require.Error(t, err)
 	require.ErrorIs(t, packets.ErrProtocolViolationReservedBit, err)
-	require.Equal(t, packets.TPacketData[packets.Connack].Get(packets.TConnackProtocolViolationNoSession).RawBytes, <-recv)
+	require.Empty(t, <-recv) // a 3.1.1 protocol violation has no CONNACK return code, so the client is just closed
 
 	_ = r.Close()
 }
@@ -841,6 +946,7 @@ func TestServerEstablishConnectionZeroByteUsernameIsValid(t *testing.T) {
 
 func TestServerEstablishConnectionInvalidConnectAckFailure(t *testing.T) {
 	s := newServer()
+	s.Options.Capabilities.MinimumProtocolVersion = 5 // refused with a 3.1.1 CONNACK 0x01
 
 	r, w := net.Pipe()
 	o := make(chan error)
@@ -849,7 +955,7 @@ func TestServerEstablishConnectionInvalidConnectAckFailure(t *testing.T) {
 	}()
 
 	go func() {
-		_, _ = w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectMalReservedBit).RawBytes)
+		_, _ = w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt311).RawBytes)
 		_ = w.Close()
 	}()
 
@@ -939,6 +1045,47 @@ func TestServerSendConnackFailureReason(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Connack].Get(packets.TConnackInvalidMinMqtt5).RawBytes, buf)
 }
 
+func TestServerSendConnackMqtt3ReturnCodes(t *testing.T) {
+	tt := []struct {
+		desc   string
+		reason packets.Code
+		want   []byte // nil: closed without a CONNACK
+	}{
+		{desc: "unsupported protocol version", reason: packets.ErrProtocolViolationProtocolVersion, want: []byte{packets.Connack << 4, 2, 0, 0x01}},
+		{desc: "client identifier too long", reason: packets.ErrClientIdentifierTooLong, want: []byte{packets.Connack << 4, 2, 0, 0x02}},
+		{desc: "server shutting down", reason: packets.ErrServerShuttingDown, want: []byte{packets.Connack << 4, 2, 0, 0x03}},
+		{desc: "banned", reason: packets.ErrBanned, want: []byte{packets.Connack << 4, 2, 0, 0x05}},
+		{desc: "not authorized", reason: packets.ErrNotAuthorized, want: []byte{packets.Connack << 4, 2, 0, 0x05}},
+		{desc: "will qos not supported", reason: packets.ErrQosNotSupported},
+		{desc: "will retain not supported", reason: packets.ErrRetainNotSupported},
+		{desc: "protocol violation", reason: packets.ErrProtocolViolationReservedBit},
+		{desc: "unspecified error", reason: packets.ErrUnspecifiedError},
+	}
+
+	for _, version := range []byte{3, 4} {
+		for _, tx := range tt {
+			t.Run(strconv.Itoa(int(version))+" "+tx.desc, func(t *testing.T) {
+				s := newServer()
+				cl, r, w := newTestClient()
+				cl.Properties.ProtocolVersion = version
+				go func() {
+					defer func() { _ = w.Close() }()
+					err := s.SendConnack(cl, tx.reason, false, nil)
+					require.NoError(t, err)
+				}()
+
+				buf, err := io.ReadAll(r)
+				require.NoError(t, err)
+				if tx.want == nil {
+					require.Empty(t, buf)
+				} else {
+					require.Equal(t, tx.want, buf)
+				}
+			})
+		}
+	}
+}
+
 func TestServerSendConnackWithServerKeepalive(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()
@@ -1003,7 +1150,7 @@ func TestServerValidateConnect(t *testing.T) {
 			client:       &Client{Properties: ClientProperties{ProtocolVersion: 3}},
 			capabilities: Capabilities{},
 			packet:       packetCleanIdPacket,
-			expect:       packets.ErrUnspecifiedError,
+			expect:       packets.ErrClientIdentifierNotValid,
 		},
 	}
 
@@ -1014,6 +1161,197 @@ func TestServerValidateConnect(t *testing.T) {
 			err := s.validateConnect(tx.client, tx.packet)
 			require.Error(t, err)
 			require.ErrorIs(t, err, tx.expect)
+		})
+	}
+}
+
+func TestServerSendConnackMaximumPacketSize(t *testing.T) {
+	s := newServer()
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	s.Options.Capabilities.MaximumPacketSize = 4096
+	go func() {
+		err := s.SendConnack(cl, packets.CodeSuccess, false, nil)
+		require.NoError(t, err)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	pk := packets.Packet{ProtocolVersion: 5}
+	require.NoError(t, pk.FixedHeader.Decode(buf[0]))
+	require.NoError(t, pk.ConnackDecode(buf[2:]))
+	require.Equal(t, uint32(4096), pk.Properties.MaximumPacketSize)
+}
+
+func TestServerSendConnackRetainNotAvailable(t *testing.T) {
+	s := newServer()
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	s.Options.Capabilities.RetainAvailable = 0
+	go func() {
+		err := s.SendConnack(cl, packets.CodeSuccess, false, nil)
+		require.NoError(t, err)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	pk := packets.Packet{ProtocolVersion: 5}
+	require.NoError(t, pk.FixedHeader.Decode(buf[0]))
+	require.NoError(t, pk.ConnackDecode(buf[2:]))
+	require.True(t, pk.Properties.RetainAvailableFlag)
+	require.Equal(t, byte(0), pk.Properties.RetainAvailable)
+}
+
+// logCapture is a logger whose output a test can read back, safe across the
+// client's write goroutine.
+type logCapture struct {
+	sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *logCapture) Write(p []byte) (int, error) {
+	l.Lock()
+	defer l.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *logCapture) String() string {
+	l.Lock()
+	defer l.Unlock()
+	return l.buf.String()
+}
+
+func newLogCapture() (*slog.Logger, *logCapture) {
+	l := new(logCapture)
+	return slog.New(slog.NewTextHandler(l, &slog.HandlerOptions{Level: slog.LevelDebug})), l
+}
+
+func TestLogLimitExceeded(t *testing.T) {
+	log, out := newLogCapture()
+	cl, _, _ := newTestClient()
+	cl.Net.Remote = "10.0.0.1:5555"
+	cl.Net.Listener = "t1"
+
+	logLimitExceeded(log, slog.LevelWarn, cl, "maximum-qos", byte(1), byte(2), "connection closed")
+	line := out.String()
+	require.Contains(t, line, "level=WARN")
+	require.Contains(t, line, `msg="client exceeded server limit"`)
+	require.Contains(t, line, "client=mochi remote=10.0.0.1:5555 listener=t1")
+	require.Contains(t, line, `limit=maximum-qos limit_value=1 value=2 action="connection closed"`)
+}
+
+func TestServerLogsLimitExceeded(t *testing.T) {
+	tt := []struct {
+		desc string
+		run  func(s *Server, cl *Client)
+		want string
+	}{
+		{
+			desc: "will qos",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.MaximumQos = 1
+				cl.Properties.Will.Qos = 2
+				_ = s.validateConnect(cl, *packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt5).Packet)
+			},
+			want: `level=WARN msg="client exceeded server limit" client=mochi remote=pipe listener="" limit=maximum-qos limit_value=1 value=2 action="will refused"`,
+		},
+		{
+			desc: "will retain",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.RetainAvailable = 0
+				cl.Properties.Will.Retain = true
+				_ = s.validateConnect(cl, *packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt5).Packet)
+			},
+			want: `limit=retain-available limit_value=0 value=1 action="will refused"`,
+		},
+		{
+			desc: "publish qos",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.MaximumQos = 0
+				cl.Properties.ProtocolVersion = 5
+				_ = s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet)
+			},
+			want: `limit=maximum-qos limit_value=0 value=1 action="connection closed"`,
+		},
+		{
+			desc: "publish retain mqtt5",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.RetainAvailable = 0
+				cl.Properties.ProtocolVersion = 5
+				_ = s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishRetainMqtt5).Packet)
+			},
+			want: `limit=retain-available limit_value=0 value=1 action="connection closed"`,
+		},
+		{
+			desc: "publish retain mqtt3",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.RetainAvailable = 0
+				cl.Properties.ProtocolVersion = 4
+				_ = s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishRetain).Packet)
+			},
+			want: `limit=retain-available limit_value=0 value=1 action="not retained"`,
+		},
+		{
+			desc: "receive maximum",
+			run: func(s *Server, cl *Client) {
+				cl.Properties.ProtocolVersion = 5
+				cl.State.Inflight.ResetReceiveQuota(0)
+				_ = s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet)
+			},
+			want: `limit=receive-maximum limit_value=0 value=1 action="connection closed"`,
+		},
+		{
+			desc: "message expiry",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.MaximumMessageExpiryInterval = 2
+				cl.Properties.ProtocolVersion = 5
+				pk := *packets.TPacketData[packets.Publish].Get(packets.TPublishBasicMqtt5).Packet
+				pk.Properties.MessageExpiryInterval = 3600
+				_ = s.processPacket(cl, pk)
+			},
+			want: `level=DEBUG msg="client exceeded server limit" client=mochi remote=pipe listener="" limit=maximum-message-expiry-interval limit_value=2 value=3600 action=capped`,
+		},
+		{
+			desc: "session expiry",
+			run: func(s *Server, cl *Client) {
+				s.Options.Capabilities.MaximumSessionExpiryInterval = 120
+				cl.Properties.ProtocolVersion = 5
+				cl.Properties.Props.SessionExpiryInterval = 300
+				_ = s.SendConnack(cl, packets.CodeSuccess, false, nil)
+			},
+			want: `level=INFO msg="client exceeded server limit" client=mochi remote=pipe listener="" limit=maximum-session-expiry-interval limit_value=120 value=300 action=capped`,
+		},
+		{
+			desc: "pending writes",
+			run: func(s *Server, _ *Client) {
+				_, w := net.Pipe()
+				cl := newClient(w, &ops{ // no write loop, so the outbound queue stays full
+					info:    new(system.Info),
+					hooks:   new(Hooks),
+					log:     logger,
+					options: &Options{Capabilities: &Capabilities{MaximumClientWritesPending: 3}},
+				})
+				for len(cl.State.outbound) < cap(cl.State.outbound) {
+					cl.State.outbound <- new(packets.Packet)
+				}
+				_, _ = s.publishToClient(cl, packets.Subscription{Filter: "a/b/c"}, packets.Packet{}, false)
+			},
+			want: `limit=maximum-client-writes-pending limit_value=3 value=4 action="message dropped"`,
+		},
+	}
+
+	for _, tx := range tt {
+		t.Run(tx.desc, func(t *testing.T) {
+			s := newServer()
+			log, out := newLogCapture()
+			s.Log = log
+			cl, r, _ := newTestClient()
+			go func() { _, _ = io.Copy(io.Discard, r) }()
+
+			tx.run(s, cl)
+			require.Contains(t, out.String(), tx.want)
 		})
 	}
 }
@@ -1741,20 +2079,88 @@ func TestServerProcessPacketPublishQos2(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Pubrec].Get(packets.TPubrec).RawBytes, buf)
 }
 
-func TestServerProcessPacketPublishDowngradeQos(t *testing.T) {
+func TestServerProcessPacketPublishQosNotSupportedMqtt3(t *testing.T) {
+	for _, version := range []byte{3, 4} {
+		t.Run(strconv.Itoa(int(version)), func(t *testing.T) {
+			s := newServer()
+			s.Options.Capabilities.MaximumQos = 1
+			cl, r, w := newTestClient()
+			cl.Properties.ProtocolVersion = version
+
+			errc := make(chan error, 1)
+			go func() {
+				defer func() { _ = w.Close() }()
+				errc <- s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos2).Packet)
+			}()
+
+			buf, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.ErrorIs(t, <-errc, packets.ErrQosNotSupported)
+			require.Empty(t, buf) // dropped, not PUBACKed at a lower QoS
+			require.True(t, cl.Closed())
+			require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+		})
+	}
+}
+
+func TestServerPublishInlineDowngradeQos(t *testing.T) {
+	s := newServerWithInlineClient()
+	s.Options.Capabilities.MaximumQos = 1
+
+	require.NoError(t, s.Publish("a/b/c", []byte("hello"), false, 2))
+	require.False(t, s.inlineClient.Closed())
+}
+
+func TestServerProcessPacketPublishQosNotSupportedMqtt5(t *testing.T) {
 	s := newServer()
 	s.Options.Capabilities.MaximumQos = 1
 	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
 
 	go func() {
+		defer func() { _ = w.Close() }()
 		err := s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos2).Packet)
-		require.NoError(t, err)
-		_ = w.Close()
+		require.ErrorIs(t, err, packets.ErrQosNotSupported)
 	}()
 
 	buf, err := io.ReadAll(r)
 	require.NoError(t, err)
-	require.Equal(t, packets.TPacketData[packets.Puback].Get(packets.TPuback).RawBytes, buf)
+	disconnect := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: 5,
+		ReasonCode:      packets.ErrQosNotSupported.Code,
+		Properties:      packets.Properties{ReasonString: packets.ErrQosNotSupported.Reason},
+	}
+	want := new(bytes.Buffer)
+	require.NoError(t, disconnect.DisconnectEncode(want))
+	require.Equal(t, want.Bytes(), buf)
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+}
+
+func TestServerProcessPacketPublishRetainNotSupportedMqtt5(t *testing.T) {
+	s := newServer()
+	s.Options.Capabilities.RetainAvailable = 0
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+
+	go func() {
+		defer func() { _ = w.Close() }()
+		err := s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishRetainMqtt5).Packet)
+		require.ErrorIs(t, err, packets.ErrRetainNotSupported)
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	disconnect := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: 5,
+		ReasonCode:      packets.ErrRetainNotSupported.Code,
+		Properties:      packets.Properties{ReasonString: packets.ErrRetainNotSupported.Reason},
+	}
+	want := new(bytes.Buffer)
+	require.NoError(t, disconnect.DisconnectEncode(want))
+	require.Equal(t, want.Bytes(), buf)
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Retained))
 }
 
 func TestPublishToSubscribersSelfNoLocal(t *testing.T) {
@@ -3040,16 +3446,51 @@ func TestServerRecievePacketDisconnectClientZeroNonZero(t *testing.T) {
 func TestServerRecievePacketDisconnectClient(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
 
+	errc := make(chan error, 1)
 	go func() {
-		err := s.DisconnectClient(cl, packets.CodeDisconnect)
-		require.NoError(t, err)
-		_ = w.Close()
+		defer func() { _ = w.Close() }()
+		errc <- s.DisconnectClient(cl, packets.ErrSessionTakenOver)
 	}()
 
 	buf, err := io.ReadAll(r)
 	require.NoError(t, err)
-	require.Equal(t, packets.TPacketData[packets.Disconnect].Get(packets.TDisconnect).RawBytes, buf)
+	require.ErrorIs(t, <-errc, packets.ErrSessionTakenOver)
+	disconnect := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: 5,
+		ReasonCode:      packets.ErrSessionTakenOver.Code,
+		Properties:      packets.Properties{ReasonString: packets.ErrSessionTakenOver.Reason},
+	}
+	want := new(bytes.Buffer)
+	require.NoError(t, disconnect.DisconnectEncode(want))
+	require.Equal(t, want.Bytes(), buf)
+	require.True(t, cl.Closed())
+}
+
+func TestServerDisconnectClientMqtt3ClosesWithoutPacket(t *testing.T) {
+	for _, version := range []byte{3, 4} {
+		t.Run(strconv.Itoa(int(version)), func(t *testing.T) {
+			s := newServer()
+			s.Options.Capabilities.Compatibilities.PassiveClientDisconnect = true // a 3.x client is closed regardless
+			cl, r, w := newTestClient()
+			cl.Properties.ProtocolVersion = version
+
+			errc := make(chan error, 1)
+			go func() {
+				defer func() { _ = w.Close() }()
+				errc <- s.DisconnectClient(cl, packets.ErrSessionTakenOver)
+			}()
+
+			buf, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.ErrorIs(t, <-errc, packets.ErrSessionTakenOver) // the pipe closes before Stop marks the client closed
+			require.Empty(t, buf)
+			require.True(t, cl.Closed())
+			require.ErrorIs(t, cl.StopCause(), packets.ErrSessionTakenOver)
+		})
+	}
 }
 
 func TestServerProcessPacketDisconnect(t *testing.T) {

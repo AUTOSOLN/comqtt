@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -381,6 +382,82 @@ func TestClientReadFixedHeaderPacketOversized(t *testing.T) {
 	err := cl.ReadFixedHeader(fh)
 	require.Error(t, err)
 	require.ErrorIs(t, err, packets.ErrPacketTooLarge)
+}
+
+func TestClientReadFixedHeaderPacketSizeIncludesLengthBytes(t *testing.T) {
+	raw := packets.TPacketData[packets.Publish].Get(packets.TPublishQos1Dup).RawBytes
+	tt := []struct {
+		desc string
+		max  uint32
+		err  error
+	}{
+		{desc: "at limit", max: uint32(len(raw))},
+		{desc: "one byte over", max: uint32(len(raw) - 1), err: packets.ErrPacketTooLarge},
+	}
+
+	for _, tx := range tt {
+		t.Run(tx.desc, func(t *testing.T) {
+			cl, r, _ := newTestClient()
+			cl.ops.options.Capabilities.MaximumPacketSize = tx.max
+			defer cl.Stop(errClientStop)
+
+			go func() {
+				_, _ = r.Write(raw)
+				_ = r.Close()
+			}()
+
+			fh := new(packets.FixedHeader)
+			err := cl.ReadFixedHeader(fh)
+			if tx.err == nil {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, tx.err)
+			}
+		})
+	}
+}
+
+func TestClientReadFixedHeaderPacketOversizedLogged(t *testing.T) {
+	cl, r, _ := newTestClient()
+	log, out := newLogCapture()
+	cl.ops.log = log
+	cl.ops.options.Capabilities.MaximumPacketSize = 2
+	defer cl.Stop(errClientStop)
+
+	raw := packets.TPacketData[packets.Publish].Get(packets.TPublishQos1Dup).RawBytes
+	go func() {
+		_, _ = r.Write(raw)
+		_ = r.Close()
+	}()
+
+	fh := new(packets.FixedHeader)
+	require.ErrorIs(t, cl.ReadFixedHeader(fh), packets.ErrPacketTooLarge)
+	require.Contains(t, out.String(), `limit=maximum-packet-size limit_value=2 value=`+strconv.Itoa(len(raw))+` action="connection closed"`)
+}
+
+func TestClientDiscardPacket(t *testing.T) {
+	cl, r, _ := newTestClient()
+	defer cl.Stop(errClientStop)
+
+	go func() {
+		_, _ = r.Write([]byte{1, 2, 3, 4, 5, 6})
+	}()
+
+	cl.discardPacket(4)
+	b, err := cl.Net.bconn.ReadByte()
+	require.NoError(t, err)
+	require.Equal(t, byte(5), b) // only the packet's own bytes are dropped
+}
+
+func TestClientDiscardPacketTimeout(t *testing.T) {
+	defer func(d time.Duration) { oversizeDiscardTimeout = d }(oversizeDiscardTimeout)
+	oversizeDiscardTimeout = 50 * time.Millisecond
+	cl, _, _ := newTestClient()
+	defer cl.Stop(errClientStop)
+
+	start := time.Now()
+	cl.discardPacket(1 << 20) // the client never sends it
+	require.Less(t, time.Since(start), time.Second)
 }
 
 func TestClientReadFixedHeaderReadEOF(t *testing.T) {

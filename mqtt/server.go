@@ -6,6 +6,7 @@
 package mqtt
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
@@ -431,6 +432,11 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 
 	err = cl.Read(s.receivePacket)
 	if err != nil {
+		// An inbound packet over the server's Maximum Packet Size is rejected in ReadFixedHeader,
+		// before any handler runs, so tell an MQTT 5 client why it is being closed.
+		if errors.Is(err, packets.ErrPacketTooLarge) && cl.Properties.ProtocolVersion == 5 && !cl.Closed() {
+			_ = s.DisconnectClient(cl, packets.ErrPacketTooLarge) // MQTT 5 §3.2.2.3.6, [MQTT-4.13.1-1]
+		}
 		s.sendLWT(cl)
 		cl.Stop(err)
 	} else {
@@ -498,14 +504,16 @@ func (s *Server) validateConnect(cl *Client, pk packets.Packet) packets.Code {
 	}
 
 	if cl.Properties.ProtocolVersion < 5 && !pk.Connect.Clean && pk.Connect.ClientIdentifier == "" {
-		return packets.ErrUnspecifiedError
+		return packets.ErrClientIdentifierNotValid // [MQTT-3.1.3-8]
 	}
 
 	if cl.Properties.ProtocolVersion < s.Options.Capabilities.MinimumProtocolVersion {
 		return packets.ErrUnsupportedProtocolVersion // [MQTT-3.1.2-2]
 	} else if cl.Properties.Will.Qos > s.Options.Capabilities.MaximumQos {
+		logLimitExceeded(s.Log, slog.LevelWarn, cl, "maximum-qos", s.Options.Capabilities.MaximumQos, cl.Properties.Will.Qos, "will refused")
 		return packets.ErrQosNotSupported // [MQTT-3.2.2-12]
 	} else if cl.Properties.Will.Retain && s.Options.Capabilities.RetainAvailable == 0x00 {
+		logLimitExceeded(s.Log, slog.LevelWarn, cl, "retain-available", s.Options.Capabilities.RetainAvailable, 1, "will refused")
 		return packets.ErrRetainNotSupported // [MQTT-3.2.2-13]
 	}
 
@@ -591,9 +599,11 @@ func (s *Server) SendConnack(cl *Client, reason packets.Code, present bool, prop
 
 	if reason.Code >= packets.ErrUnspecifiedError.Code {
 		if cl.Properties.ProtocolVersion < 5 {
-			if v3reason, ok := packets.V5CodesToV3[reason]; ok { // NB v3 3.2.2.3 Connack return codes
-				reason = v3reason
+			v3reason, ok := packets.V5CodesToV3[reason] // NB v3 3.2.2.3 Connack return codes
+			if !ok {
+				return nil // no v3 return code for this refusal, so close without a CONNACK
 			}
+			reason = v3reason
 		}
 
 		properties.ReasonString = reason.Reason
@@ -613,11 +623,21 @@ func (s *Server) SendConnack(cl *Client, reason packets.Code, present bool, prop
 		properties.MaximumQosFlag = true
 	}
 
+	if s.Options.Capabilities.RetainAvailable == 0 {
+		properties.RetainAvailable = 0 // 3.2.2.3.5 Retain Available
+		properties.RetainAvailableFlag = true
+	}
+
+	if s.Options.Capabilities.MaximumPacketSize > 0 {
+		properties.MaximumPacketSize = s.Options.Capabilities.MaximumPacketSize // 3.2.2.3.6 Maximum Packet Size
+	}
+
 	if cl.Properties.Props.AssignedClientID != "" {
 		properties.AssignedClientID = cl.Properties.Props.AssignedClientID // [MQTT-3.1.3-7] [MQTT-3.2.2-16]
 	}
 
 	if cl.Properties.Props.SessionExpiryInterval > s.Options.Capabilities.MaximumSessionExpiryInterval {
+		logLimitExceeded(s.Log, slog.LevelInfo, cl, "maximum-session-expiry-interval", s.Options.Capabilities.MaximumSessionExpiryInterval, cl.Properties.Props.SessionExpiryInterval, "capped")
 		properties.SessionExpiryInterval = s.Options.Capabilities.MaximumSessionExpiryInterval
 		properties.SessionExpiryIntervalFlag = true
 		cl.Properties.Props.SessionExpiryInterval = properties.SessionExpiryInterval
@@ -859,7 +879,31 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	}
 
 	if atomic.LoadInt32(&cl.State.Inflight.receiveQuota) == 0 {
+		maximum := atomic.LoadInt32(&cl.State.Inflight.maximumReceiveQuota)
+		logLimitExceeded(s.Log, slog.LevelWarn, cl, "receive-maximum", maximum, maximum+1, "connection closed")
 		return s.DisconnectClient(cl, packets.ErrReceiveMaximum) // ~[MQTT-3.3.4-7] ~[MQTT-3.3.4-8]
+	}
+
+	// A PUBLISH over the server's Maximum QoS is refused: MQTT 5 clients get DISCONNECT 0x9B, and a 3.x
+	// client is dropped, since acknowledging a lower QoS would break its QoS 2 flow. Only the inline
+	// client is downgraded below.
+	if !cl.Net.Inline && pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
+		logLimitExceeded(s.Log, slog.LevelWarn, cl, "maximum-qos", s.Options.Capabilities.MaximumQos, pk.FixedHeader.Qos, "connection closed")
+		return s.DisconnectClient(cl, packets.ErrQosNotSupported) // MQTT 5 §3.2.2.3.4
+	}
+
+	// Likewise Retain Available 0 was announced in CONNACK. Older clients get live delivery only.
+	if !cl.Net.Inline && pk.FixedHeader.Retain && s.Options.Capabilities.RetainAvailable == 0 {
+		if cl.Properties.ProtocolVersion == 5 {
+			logLimitExceeded(s.Log, slog.LevelWarn, cl, "retain-available", s.Options.Capabilities.RetainAvailable, 1, "connection closed")
+			return s.DisconnectClient(cl, packets.ErrRetainNotSupported) // MQTT 5 §3.2.2.3.5
+		}
+		logLimitExceeded(s.Log, slog.LevelWarn, cl, "retain-available", s.Options.Capabilities.RetainAvailable, 1, "not retained")
+	}
+
+	if !cl.Net.Inline && int64(pk.Properties.MessageExpiryInterval) > s.Options.Capabilities.MaximumMessageExpiryInterval {
+		// Debug, not Warn: a client can do this on every PUBLISH, and the server only shortens the expiry.
+		logLimitExceeded(s.Log, slog.LevelDebug, cl, "maximum-message-expiry-interval", s.Options.Capabilities.MaximumMessageExpiryInterval, pk.Properties.MessageExpiryInterval, "capped")
 	}
 
 	if !cl.Net.Inline && !s.hooks.OnACLCheck(cl, pk.TopicName, true) {
@@ -900,7 +944,7 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	}
 
 	if pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
-		pk.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9] Reduce qos based on server max qos capability
+		pk.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9] Reduce the inline client's qos to the server max qos capability
 	}
 
 	pkx, err := s.hooks.OnPublish(cl, pk)
@@ -1178,6 +1222,7 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 	case cl.State.outbound <- &out:
 		atomic.AddInt32(&cl.State.outboundQty, 1)
 	default:
+		logLimitExceeded(s.Log, slog.LevelWarn, cl, "maximum-client-writes-pending", cap(cl.State.outbound), len(cl.State.outbound)+1, "message dropped")
 		atomic.AddInt64(&s.Info.MessagesDropped, 1)
 		cl.ops.hooks.OnPublishDropped(cl, pk)
 
@@ -1521,8 +1566,25 @@ func (s *Server) processDisconnect(cl *Client, pk packets.Packet) error {
 	return nil
 }
 
+// logLimitExceeded logs a client going over one of the server's configured limits: the limit's
+// Capabilities name, the value it is set to, the value the client sent or needed, and what the
+// server did about it.
+func logLimitExceeded(log *slog.Logger, level slog.Level, cl *Client, limit string, max, value any, action string) {
+	log.Log(context.Background(), level, "client exceeded server limit", "client", cl.ID, "remote", cl.Net.Remote,
+		"listener", cl.Net.Listener, "limit", limit, "limit_value", max, "value", value, "action", action)
+}
+
 // DisconnectClient sends a Disconnect packet to a client and then closes the client connection.
+// MQTT 3.x has no server-sent DISCONNECT, so a 3.x client's connection is only closed.
 func (s *Server) DisconnectClient(cl *Client, code packets.Code) error {
+	if cl.Properties.ProtocolVersion < 5 {
+		cl.Stop(code)
+		if code.Code >= packets.ErrUnspecifiedError.Code {
+			return code
+		}
+		return nil
+	}
+
 	out := packets.Packet{
 		FixedHeader: packets.FixedHeader{
 			Type: packets.Disconnect,

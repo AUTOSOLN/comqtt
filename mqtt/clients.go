@@ -456,7 +456,8 @@ func (cl *Client) ReadFixedHeader(fh *packets.FixedHeader) error {
 		return err
 	}
 
-	if cl.ops.options.Capabilities.MaximumPacketSize > 0 && uint32(fh.Remaining+1) > cl.ops.options.Capabilities.MaximumPacketSize {
+	// The whole packet is the fixed header byte, the bu Remaining Length bytes and the Remaining Length.
+	if cl.ops.options.Capabilities.MaximumPacketSize > 0 && uint32(fh.Remaining+1+bu) > cl.ops.options.Capabilities.MaximumPacketSize {
 		return packets.ErrPacketTooLarge // [MQTT-3.2.2-15]
 	}
 

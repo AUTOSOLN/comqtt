@@ -138,15 +138,26 @@ var (
 	// V5CodesToV3 maps MQTTv5 Connack reason codes to MQTTv3 return codes.
 	// This is required because MQTTv3 has different return byte specification.
 	// See http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc385349257
+	// A code with no entry has no v3 equivalent (a protocol violation, or a v5-only limit such as
+	// Maximum QoS or Retain Available), so the v3 client is closed without a CONNACK.
 	V5CodesToV3 = map[Code]Code{
-		ErrUnsupportedProtocolVersion: Err3UnsupportedProtocolVersion,
-		ErrClientIdentifierNotValid:   Err3ClientIdentifierNotValid,
-		ErrServerUnavailable:          Err3ServerUnavailable,
-		ErrMalformedUsername:          ErrMalformedUsernameOrPassword,
-		ErrMalformedPassword:          ErrMalformedUsernameOrPassword,
-		ErrBadUsernameOrPassword:      Err3NotAuthorized,
+		ErrUnsupportedProtocolVersion:       Err3UnsupportedProtocolVersion,
+		ErrProtocolViolationProtocolVersion: Err3UnsupportedProtocolVersion, // [MQTT-3.1.2-2]
+		ErrClientIdentifierNotValid:         Err3ClientIdentifierNotValid,
+		ErrClientIdentifierTooLong:          Err3ClientIdentifierNotValid,
+		ErrServerUnavailable:                Err3ServerUnavailable,
+		ErrMalformedUsername:                ErrMalformedUsernameOrPassword,
+		ErrMalformedPassword:                ErrMalformedUsernameOrPassword,
+		ErrBadUsernameOrPassword:            Err3NotAuthorized,
+		ErrNotAuthorized:                    Err3NotAuthorized,
+		ErrBanned:                           Err3NotAuthorized,
 		// MQTTv3 has no distinct "busy" return code, so a v5 ErrServerBusy
-		// CONNACK downgrades to "server unavailable" for v3 clients.
-		ErrServerBusy: Err3ServerUnavailable,
+		// CONNACK downgrades to "server unavailable" for v3 clients, as do the
+		// other refusals that only say the server can't take the client now.
+		ErrServerBusy:             Err3ServerUnavailable,
+		ErrServerShuttingDown:     Err3ServerUnavailable,
+		ErrUseAnotherServer:       Err3ServerUnavailable,
+		ErrServerMoved:            Err3ServerUnavailable,
+		ErrConnectionRateExceeded: Err3ServerUnavailable,
 	}
 )

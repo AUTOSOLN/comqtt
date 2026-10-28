@@ -852,7 +852,7 @@ func TestServerEstablishConnectionInvalidConnect(t *testing.T) {
 	err := <-o
 	require.Error(t, err)
 	require.ErrorIs(t, packets.ErrProtocolViolationReservedBit, err)
-	require.Equal(t, packets.TPacketData[packets.Connack].Get(packets.TConnackProtocolViolationNoSession).RawBytes, <-recv)
+	require.Empty(t, <-recv) // a 3.1.1 protocol violation has no CONNACK return code, so the client is just closed
 
 	_ = r.Close()
 }
@@ -886,6 +886,7 @@ func TestServerEstablishConnectionZeroByteUsernameIsValid(t *testing.T) {
 
 func TestServerEstablishConnectionInvalidConnectAckFailure(t *testing.T) {
 	s := newServer()
+	s.Options.Capabilities.MinimumProtocolVersion = 5 // refused with a 3.1.1 CONNACK 0x01
 
 	r, w := net.Pipe()
 	o := make(chan error)
@@ -894,7 +895,7 @@ func TestServerEstablishConnectionInvalidConnectAckFailure(t *testing.T) {
 	}()
 
 	go func() {
-		_, _ = w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectMalReservedBit).RawBytes)
+		_, _ = w.Write(packets.TPacketData[packets.Connect].Get(packets.TConnectMqtt311).RawBytes)
 		_ = w.Close()
 	}()
 
@@ -984,6 +985,47 @@ func TestServerSendConnackFailureReason(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Connack].Get(packets.TConnackInvalidMinMqtt5).RawBytes, buf)
 }
 
+func TestServerSendConnackMqtt3ReturnCodes(t *testing.T) {
+	tt := []struct {
+		desc   string
+		reason packets.Code
+		want   []byte // nil: closed without a CONNACK
+	}{
+		{desc: "unsupported protocol version", reason: packets.ErrProtocolViolationProtocolVersion, want: []byte{packets.Connack << 4, 2, 0, 0x01}},
+		{desc: "client identifier too long", reason: packets.ErrClientIdentifierTooLong, want: []byte{packets.Connack << 4, 2, 0, 0x02}},
+		{desc: "server shutting down", reason: packets.ErrServerShuttingDown, want: []byte{packets.Connack << 4, 2, 0, 0x03}},
+		{desc: "banned", reason: packets.ErrBanned, want: []byte{packets.Connack << 4, 2, 0, 0x05}},
+		{desc: "not authorized", reason: packets.ErrNotAuthorized, want: []byte{packets.Connack << 4, 2, 0, 0x05}},
+		{desc: "will qos not supported", reason: packets.ErrQosNotSupported},
+		{desc: "will retain not supported", reason: packets.ErrRetainNotSupported},
+		{desc: "protocol violation", reason: packets.ErrProtocolViolationReservedBit},
+		{desc: "unspecified error", reason: packets.ErrUnspecifiedError},
+	}
+
+	for _, version := range []byte{3, 4} {
+		for _, tx := range tt {
+			t.Run(strconv.Itoa(int(version))+" "+tx.desc, func(t *testing.T) {
+				s := newServer()
+				cl, r, w := newTestClient()
+				cl.Properties.ProtocolVersion = version
+				go func() {
+					defer func() { _ = w.Close() }()
+					err := s.SendConnack(cl, tx.reason, false, nil)
+					require.NoError(t, err)
+				}()
+
+				buf, err := io.ReadAll(r)
+				require.NoError(t, err)
+				if tx.want == nil {
+					require.Empty(t, buf)
+				} else {
+					require.Equal(t, tx.want, buf)
+				}
+			})
+		}
+	}
+}
+
 func TestServerSendConnackWithServerKeepalive(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()
@@ -1048,7 +1090,7 @@ func TestServerValidateConnect(t *testing.T) {
 			client:       &Client{Properties: ClientProperties{ProtocolVersion: 3}},
 			capabilities: Capabilities{},
 			packet:       packetCleanIdPacket,
-			expect:       packets.ErrUnspecifiedError,
+			expect:       packets.ErrClientIdentifierNotValid,
 		},
 	}
 

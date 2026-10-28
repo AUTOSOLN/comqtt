@@ -503,7 +503,7 @@ func (s *Server) validateConnect(cl *Client, pk packets.Packet) packets.Code {
 	}
 
 	if cl.Properties.ProtocolVersion < 5 && !pk.Connect.Clean && pk.Connect.ClientIdentifier == "" {
-		return packets.ErrUnspecifiedError
+		return packets.ErrClientIdentifierNotValid // [MQTT-3.1.3-8]
 	}
 
 	if cl.Properties.ProtocolVersion < s.Options.Capabilities.MinimumProtocolVersion {
@@ -596,9 +596,11 @@ func (s *Server) SendConnack(cl *Client, reason packets.Code, present bool, prop
 
 	if reason.Code >= packets.ErrUnspecifiedError.Code {
 		if cl.Properties.ProtocolVersion < 5 {
-			if v3reason, ok := packets.V5CodesToV3[reason]; ok { // NB v3 3.2.2.3 Connack return codes
-				reason = v3reason
+			v3reason, ok := packets.V5CodesToV3[reason] // NB v3 3.2.2.3 Connack return codes
+			if !ok {
+				return nil // no v3 return code for this refusal, so close without a CONNACK
 			}
+			reason = v3reason
 		}
 
 		properties.ReasonString = reason.Reason

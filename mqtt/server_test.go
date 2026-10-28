@@ -939,6 +939,30 @@ func TestServerSendConnackFailureReason(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Connack].Get(packets.TConnackInvalidMinMqtt5).RawBytes, buf)
 }
 
+func TestServerSendConnackV3ProtocolViolation(t *testing.T) {
+	tt := []packets.Code{
+		packets.ErrProtocolViolationProtocolName,
+		packets.ErrProtocolViolationProtocolVersion,
+	}
+
+	for _, reason := range tt {
+		t.Run(reason.Reason, func(t *testing.T) {
+			s := newServer()
+			cl, r, w := newTestClient()
+			cl.Properties.ProtocolVersion = 4
+			go func() {
+				err := s.SendConnack(cl, reason, false, nil)
+				require.NoError(t, err)
+				_ = w.Close()
+			}()
+
+			buf, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.Equal(t, []byte{packets.Connack << 4, 2, 0, packets.Err3UnsupportedProtocolVersion.Code}, buf)
+		})
+	}
+}
+
 func TestServerSendConnackWithServerKeepalive(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()

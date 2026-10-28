@@ -1082,6 +1082,26 @@ func TestServerSendConnackMaximumPacketSize(t *testing.T) {
 	require.Equal(t, uint32(4096), pk.Properties.MaximumPacketSize)
 }
 
+func TestServerSendConnackRetainNotAvailable(t *testing.T) {
+	s := newServer()
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	s.Options.Capabilities.RetainAvailable = 0
+	go func() {
+		err := s.SendConnack(cl, packets.CodeSuccess, false, nil)
+		require.NoError(t, err)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	pk := packets.Packet{ProtocolVersion: 5}
+	require.NoError(t, pk.FixedHeader.Decode(buf[0]))
+	require.NoError(t, pk.ConnackDecode(buf[2:]))
+	require.True(t, pk.Properties.RetainAvailableFlag)
+	require.Equal(t, byte(0), pk.Properties.RetainAvailable)
+}
+
 func TestServerSendConnackAdjustedExpiryInterval(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()
@@ -1845,6 +1865,32 @@ func TestServerProcessPacketPublishQosNotSupportedMqtt5(t *testing.T) {
 	require.NoError(t, disconnect.DisconnectEncode(want))
 	require.Equal(t, want.Bytes(), buf)
 	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Inflight))
+}
+
+func TestServerProcessPacketPublishRetainNotSupportedMqtt5(t *testing.T) {
+	s := newServer()
+	s.Options.Capabilities.RetainAvailable = 0
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+
+	go func() {
+		defer func() { _ = w.Close() }()
+		err := s.processPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishRetainMqtt5).Packet)
+		require.ErrorIs(t, err, packets.ErrRetainNotSupported)
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	disconnect := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Disconnect},
+		ProtocolVersion: 5,
+		ReasonCode:      packets.ErrRetainNotSupported.Code,
+		Properties:      packets.Properties{ReasonString: packets.ErrRetainNotSupported.Reason},
+	}
+	want := new(bytes.Buffer)
+	require.NoError(t, disconnect.DisconnectEncode(want))
+	require.Equal(t, want.Bytes(), buf)
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Retained))
 }
 
 func TestPublishToSubscribersSelfNoLocal(t *testing.T) {

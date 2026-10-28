@@ -618,6 +618,11 @@ func (s *Server) SendConnack(cl *Client, reason packets.Code, present bool, prop
 		properties.MaximumQosFlag = true
 	}
 
+	if s.Options.Capabilities.RetainAvailable == 0 {
+		properties.RetainAvailable = 0 // 3.2.2.3.5 Retain Available
+		properties.RetainAvailableFlag = true
+	}
+
 	if s.Options.Capabilities.MaximumPacketSize > 0 {
 		properties.MaximumPacketSize = s.Options.Capabilities.MaximumPacketSize // 3.2.2.3.6 Maximum Packet Size
 	}
@@ -875,6 +880,11 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	// refused. Older clients can't know the limit and keep the downgrade below.
 	if !cl.Net.Inline && cl.Properties.ProtocolVersion == 5 && pk.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
 		return s.DisconnectClient(cl, packets.ErrQosNotSupported) // MQTT 5 §3.2.2.3.4
+	}
+
+	// Likewise Retain Available 0 was announced in CONNACK. Older clients get live delivery only.
+	if !cl.Net.Inline && cl.Properties.ProtocolVersion == 5 && pk.FixedHeader.Retain && s.Options.Capabilities.RetainAvailable == 0 {
+		return s.DisconnectClient(cl, packets.ErrRetainNotSupported) // MQTT 5 §3.2.2.3.5
 	}
 
 	if !cl.Net.Inline && !s.hooks.OnACLCheck(cl, pk.TopicName, true) {

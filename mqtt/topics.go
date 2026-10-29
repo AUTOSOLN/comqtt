@@ -737,9 +737,15 @@ func IsValidFilter(filter string, forPublish bool) bool {
 		}
 	}
 
-	wildhash := strings.IndexRune(filter, '#')
-	if wildhash >= 0 && wildhash != len(filter)-1 { // [MQTT-4.7.1-2]
-		return false
+	levels := strings.Split(filter, "/")
+	for i, level := range levels {
+		if len(level) > 1 && strings.ContainsAny(level, "+#") {
+			return false // wildcards must occupy an entire level [MQTT-4.7.1-1] [MQTT-4.7.1-2]
+		}
+
+		if level == "#" && i != len(levels)-1 {
+			return false // multi-level wildcard must be the last level [MQTT-4.7.1-1]
+		}
 	}
 
 	prefix, hasNext := isolateParticle(filter, 0)

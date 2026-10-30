@@ -836,6 +836,7 @@ func (s *Server) Unsubscribe(filter string, subscriptionId int) error {
 
 // InjectPacket injects a packet into the broker as if it were sent from the specified client.
 // InlineClients using this method can publish packets to any topic (including $SYS) and bypass ACL checks.
+// Packets from inline clients are not counted in the received counters.
 func (s *Server) InjectPacket(cl *Client, pk packets.Packet) error {
 	pk.ProtocolVersion = cl.Properties.ProtocolVersion
 
@@ -844,9 +845,11 @@ func (s *Server) InjectPacket(cl *Client, pk packets.Packet) error {
 		return err
 	}
 
-	atomic.AddInt64(&cl.ops.info.PacketsReceived, 1)
-	if pk.FixedHeader.Type == packets.Publish {
-		atomic.AddInt64(&cl.ops.info.MessagesReceived, 1)
+	if !cl.Net.Inline {
+		atomic.AddInt64(&cl.ops.info.PacketsReceived, 1)
+		if pk.FixedHeader.Type == packets.Publish {
+			atomic.AddInt64(&cl.ops.info.MessagesReceived, 1)
+		}
 	}
 
 	return nil

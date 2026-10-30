@@ -380,6 +380,7 @@ func (p *Properties) Decode(pkt byte, b *bytes.Buffer) (n int, err error) {
 
 	bt := b.Bytes()
 	var k byte
+	var seen [256]bool
 	for offset := 0; offset < n; {
 		k, offset, err = decodeByte(bt, offset)
 		if err != nil {
@@ -389,6 +390,12 @@ func (p *Properties) Decode(pkt byte, b *bytes.Buffer) (n int, err error) {
 		if _, ok := validPacketProperties[k][pkt]; !ok {
 			return n + bu, fmt.Errorf("property type %v not valid for packet type %v: %w", k, pkt, ErrProtocolViolationUnsupportedProperty)
 		}
+
+		// Only User Property, and Subscription Identifier in PUBLISH, may appear more than once.
+		if seen[k] && k != PropUser && !(k == PropSubscriptionIdentifier && pkt == Publish) {
+			return n + bu, fmt.Errorf("property type %v included more than once: %w", k, ErrProtocolViolationDuplicateProperty)
+		}
+		seen[k] = true
 
 		switch k {
 		case PropPayloadFormat:

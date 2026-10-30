@@ -90,6 +90,7 @@ var (
 	ErrProtocolViolationOversizeSubID         = Code{Code: 0x82, Reason: "protocol violation: oversize subscription id"}
 	ErrProtocolViolationDupNoQos              = Code{Code: 0x82, Reason: "protocol violation: dup true with no qos"}
 	ErrProtocolViolationUnsupportedProperty   = Code{Code: 0x82, Reason: "protocol violation: unsupported property"}
+	ErrProtocolViolationDuplicateProperty     = Code{Code: 0x82, Reason: "protocol violation: duplicate property"}
 	ErrProtocolViolationNoTopic               = Code{Code: 0x82, Reason: "protocol violation: no topic or alias"}
 	ErrImplementationSpecificError            = Code{Code: 0x83, Reason: "implementation specific error"}
 	ErrRejectPacket                           = Code{Code: 0x83, Reason: "packet rejected"}

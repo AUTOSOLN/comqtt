@@ -1523,6 +1523,14 @@ func (s *Server) processDisconnect(cl *Client, pk packets.Packet) error {
 
 // DisconnectClient sends a Disconnect packet to a client and then closes the client connection.
 func (s *Server) DisconnectClient(cl *Client, code packets.Code) error {
+	if cl.Properties.ProtocolVersion < 5 {
+		cl.Stop(code)
+		if code.Code >= packets.ErrUnspecifiedError.Code {
+			return code
+		}
+		return nil
+	}
+
 	out := packets.Packet{
 		FixedHeader: packets.FixedHeader{
 			Type: packets.Disconnect,

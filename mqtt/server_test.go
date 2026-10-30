@@ -714,7 +714,7 @@ func TestEstablishConnectionInheritExistingClean(t *testing.T) {
 	require.ErrorIs(t, retrievedCl.StopCause(), packets.CodeDisconnect) // true error is disconnect
 
 	require.Equal(t, packets.TPacketData[packets.Connack].Get(packets.TConnackAcceptedNoSession).RawBytes, <-recv)
-	require.Equal(t, packets.TPacketData[packets.Disconnect].Get(packets.TDisconnect).RawBytes, <-takeover)
+	require.Empty(t, <-takeover) // mqtt v3 clients are not sent a disconnect packet
 
 	_ = w.Close()
 	_ = r.Close()
@@ -3040,16 +3040,33 @@ func TestServerRecievePacketDisconnectClientZeroNonZero(t *testing.T) {
 func TestServerRecievePacketDisconnectClient(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
 
 	go func() {
-		err := s.DisconnectClient(cl, packets.CodeDisconnect)
-		require.NoError(t, err)
+		err := s.DisconnectClient(cl, packets.ErrServerShuttingDown)
+		require.ErrorIs(t, err, packets.ErrServerShuttingDown)
 		_ = w.Close()
 	}()
 
 	buf, err := io.ReadAll(r)
 	require.NoError(t, err)
-	require.Equal(t, packets.TPacketData[packets.Disconnect].Get(packets.TDisconnect).RawBytes, buf)
+	require.Equal(t, packets.TPacketData[packets.Disconnect].Get(packets.TDisconnectShuttingDown).RawBytes, buf)
+}
+
+func TestServerRecievePacketDisconnectClientMqtt311(t *testing.T) {
+	s := newServer()
+	cl, r, _ := newTestClient()
+	cl.Properties.ProtocolVersion = 4
+
+	go func() {
+		err := s.DisconnectClient(cl, packets.ErrSessionTakenOver)
+		require.ErrorIs(t, err, packets.ErrSessionTakenOver)
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Empty(t, buf) // no disconnect packet is sent to mqtt v3 clients
+	require.ErrorIs(t, cl.StopCause(), packets.ErrSessionTakenOver)
 }
 
 func TestServerProcessPacketDisconnect(t *testing.T) {

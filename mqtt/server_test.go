@@ -1309,6 +1309,42 @@ func TestInjectPacketNonInlineCountedAsReceived(t *testing.T) {
 	require.Equal(t, int64(1), atomic.LoadInt64(&cl.ops.info.PacketsReceived))
 }
 
+func TestServerPublishToSubscriberCountsSentNotReceived(t *testing.T) {
+	s := newServerWithInlineClient()
+	_ = s.Serve()
+	defer s.Close()
+
+	receiver, r2, w2 := newTestClient()
+	receiver.ID = "receiver"
+	s.Clients.Add(receiver)
+	s.Topics.Subscribe(receiver.ID, packets.Subscription{Filter: "a/b/c"})
+
+	receiverBuf := make(chan []byte)
+	go func() {
+		buf, err := io.ReadAll(r2)
+		require.NoError(t, err)
+		receiverBuf <- buf
+	}()
+
+	go func() {
+		pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).Packet
+		err := s.Publish(pkx.TopicName, pkx.Payload, pkx.FixedHeader.Retain, pkx.FixedHeader.Qos)
+		require.NoError(t, err)
+		time.Sleep(time.Millisecond * 10)
+		_ = w2.Close()
+	}()
+
+	require.Equal(t, packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).RawBytes, <-receiverBuf)
+
+	// newTestClient gives the receiver its own system.Info, so sent counts land there.
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt64(&receiver.ops.info.MessagesSent) == 1
+	}, time.Second, 5*time.Millisecond)
+
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.MessagesReceived))
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.PacketsReceived))
+}
+
 func TestServerPublishNoInlineClient(t *testing.T) {
 	s := newServer()
 	pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).Packet

@@ -2985,6 +2985,57 @@ func TestServerProcessPacketUnsubscribe(t *testing.T) {
 	require.Equal(t, int64(-1), atomic.LoadInt64(&s.Info.Subscriptions))
 }
 
+func TestServerProcessUnsubscribeACLCheckDeny(t *testing.T) {
+	cc := *DefaultServerCapabilities // copy: other tests mutate the shared defaults
+	cc.Compatibilities.ObscureNotAuthorized = false
+	s := New(&Options{
+		Logger:       logger,
+		Capabilities: &cc,
+	})
+	_ = s.Serve()
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	s.Topics.Subscribe(cl.ID, packets.Subscription{Filter: "a/b", Qos: 0})
+	cl.State.Subscriptions.Add("a/b", packets.Subscription{Filter: "a/b", Qos: 0})
+
+	go func() {
+		err := s.processUnsubscribe(cl, *packets.TPacketData[packets.Unsubscribe].Get(packets.TUnsubscribeMqtt5).Packet)
+		require.NoError(t, err)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, []byte{packets.ErrNotAuthorized.Code, packets.ErrNotAuthorized.Code}, buf[len(buf)-2:]) // one reason code per filter
+
+	_, ok := cl.State.Subscriptions.Get("a/b")
+	require.True(t, ok)
+	require.Len(t, s.Topics.Subscribers("a/b").Subscriptions, 1)
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Subscriptions))
+}
+
+func TestServerProcessUnsubscribeACLCheckDenyObscure(t *testing.T) {
+	cc := *DefaultServerCapabilities // copy: other tests mutate the shared defaults
+	s := New(&Options{
+		Logger:       logger,
+		Capabilities: &cc,
+	})
+	_ = s.Serve()
+	s.Options.Capabilities.Compatibilities.ObscureNotAuthorized = true
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+
+	go func() {
+		err := s.processUnsubscribe(cl, *packets.TPacketData[packets.Unsubscribe].Get(packets.TUnsubscribeMqtt5).Packet)
+		require.NoError(t, err)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, []byte{packets.ErrUnspecifiedError.Code, packets.ErrUnspecifiedError.Code}, buf[len(buf)-2:]) // one reason code per filter
+}
+
 func TestServerProcessPacketUnsubscribePackedIDInUse(t *testing.T) {
 	s := newServer()
 	cl, r, w := newTestClient()

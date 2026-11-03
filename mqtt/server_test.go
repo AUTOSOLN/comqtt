@@ -2308,6 +2308,43 @@ func TestPublishToClientServerTopicAlias(t *testing.T) {
 	require.Equal(t, append(pk1, pk2...), ret)
 }
 
+func TestPublishToClientServerTopicAliasNotRegisteredWhenTooLarge(t *testing.T) {
+	s := newServer()
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	cl.Properties.Props.TopicAliasMaximum = 5
+	cl.Properties.Props.MaximumPacketSize = 64
+	s.Clients.Add(cl)
+
+	big := packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Publish},
+		TopicName:   "a/b/c",
+		Payload:     make([]byte, 128),
+	}
+	small := big.Copy(false)
+	small.Payload = []byte("hello")
+
+	go func() {
+		_, _ = s.publishToClient(cl, packets.Subscription{Filter: big.TopicName}, big, false)
+		_, _ = s.publishToClient(cl, packets.Subscription{Filter: small.TopicName}, small, false)
+		time.Sleep(time.Millisecond)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+
+	// only the small packet is delivered, carrying both the topic name and the alias.
+	got := packets.Packet{ProtocolVersion: 5}
+	require.NoError(t, got.FixedHeader.Decode(buf[0]))
+	require.Equal(t, packets.Publish, got.FixedHeader.Type)
+	require.NoError(t, got.PublishDecode(buf[2:]))
+	require.Equal(t, "a/b/c", got.TopicName)
+	require.Equal(t, uint16(1), got.Properties.TopicAlias)
+	require.Equal(t, []byte("hello"), got.Payload)
+	require.Len(t, buf, 2+int(buf[1]))
+}
+
 func TestPublishToClientMqtt3RetainFalseLeverageNoConn(t *testing.T) {
 	s := newServer()
 	cl, _, _ := newTestClient()
@@ -3241,6 +3278,57 @@ func TestServerProcessPacketUnsubscribe(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, packets.TPacketData[packets.Unsuback].Get(packets.TUnsubackMqtt5).RawBytes, buf)
 	require.Equal(t, int64(-1), atomic.LoadInt64(&s.Info.Subscriptions))
+}
+
+func TestServerProcessUnsubscribeACLCheckDeny(t *testing.T) {
+	cc := *DefaultServerCapabilities // copy: other tests mutate the shared defaults
+	cc.Compatibilities.ObscureNotAuthorized = false
+	s := New(&Options{
+		Logger:       logger,
+		Capabilities: &cc,
+	})
+	_ = s.Serve()
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	s.Topics.Subscribe(cl.ID, packets.Subscription{Filter: "a/b", Qos: 0})
+	cl.State.Subscriptions.Add("a/b", packets.Subscription{Filter: "a/b", Qos: 0})
+
+	go func() {
+		err := s.processUnsubscribe(cl, *packets.TPacketData[packets.Unsubscribe].Get(packets.TUnsubscribeMqtt5).Packet)
+		require.NoError(t, err)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, []byte{packets.ErrNotAuthorized.Code, packets.ErrNotAuthorized.Code}, buf[len(buf)-2:]) // one reason code per filter
+
+	_, ok := cl.State.Subscriptions.Get("a/b")
+	require.True(t, ok)
+	require.Len(t, s.Topics.Subscribers("a/b").Subscriptions, 1)
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.Subscriptions))
+}
+
+func TestServerProcessUnsubscribeACLCheckDenyObscure(t *testing.T) {
+	cc := *DefaultServerCapabilities // copy: other tests mutate the shared defaults
+	s := New(&Options{
+		Logger:       logger,
+		Capabilities: &cc,
+	})
+	_ = s.Serve()
+	s.Options.Capabilities.Compatibilities.ObscureNotAuthorized = true
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+
+	go func() {
+		err := s.processUnsubscribe(cl, *packets.TPacketData[packets.Unsubscribe].Get(packets.TUnsubscribeMqtt5).Packet)
+		require.NoError(t, err)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, []byte{packets.ErrUnspecifiedError.Code, packets.ErrUnspecifiedError.Code}, buf[len(buf)-2:]) // one reason code per filter
 }
 
 func TestServerProcessPacketUnsubscribePackedIDInUse(t *testing.T) {

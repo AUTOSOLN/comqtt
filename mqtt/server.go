@@ -1138,17 +1138,6 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		out.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9]
 	}
 
-	if cl.Properties.Props.TopicAliasMaximum > 0 {
-		var aliasExists bool
-		out.Properties.TopicAlias, aliasExists = cl.State.TopicAliases.Outbound.Set(pk.TopicName)
-		if out.Properties.TopicAlias > 0 {
-			out.Properties.TopicAliasFlag = true
-			if aliasExists {
-				out.TopicName = ""
-			}
-		}
-	}
-
 	if out.FixedHeader.Qos > 0 {
 		if direct {
 			// Shutdown direct-write path: skip inflight tracking and the send-quota
@@ -1459,6 +1448,18 @@ func (s *Server) processUnsubscribe(cl *Client, pk packets.Packet) error {
 	for i, sub := range pk.Filters {       // [MQTT-3.10.4-6] [MQTT-3.11.3-1]
 		if code != packets.CodeSuccess {
 			reasonCodes[i] = code.Code // NB 3.11.3 Non-normative 0x91
+			continue
+		}
+
+		// Unsubscribing requires the same (read) permission as subscribing, so a
+		// client can't remove subscriptions on filters it isn't authorized for.
+		// MQTT3 UNSUBACK carries no reason codes, so a denied filter there is
+		// simply left subscribed.
+		if !s.hooks.OnACLCheck(cl, sub.Filter, false) {
+			reasonCodes[i] = packets.ErrNotAuthorized.Code
+			if s.Options.Capabilities.Compatibilities.ObscureNotAuthorized {
+				reasonCodes[i] = packets.ErrUnspecifiedError.Code
+			}
 			continue
 		}
 

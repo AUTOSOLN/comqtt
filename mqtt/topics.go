@@ -85,6 +85,18 @@ func (a *OutboundTopicAliases) Set(topic string) (uint16, bool) {
 	a.Lock()
 	defer a.Unlock()
 
+	alias, exists := a.peek(topic)
+	if alias > 0 && !exists {
+		a.register(topic, alias)
+	}
+
+	return alias, exists
+}
+
+// peek returns the alias already registered for a topic, or the next unused alias
+// value if the topic has none, without registering it. A zero alias indicates that
+// no alias is available. The caller must hold the lock.
+func (a *OutboundTopicAliases) peek(topic string) (uint16, bool) {
 	if a.maximum == 0 {
 		return 0, false
 	}
@@ -95,13 +107,17 @@ func (a *OutboundTopicAliases) Set(topic string) (uint16, bool) {
 
 	i := atomic.LoadUint32(&a.cursor)
 	if i+1 > uint32(a.maximum) {
-		// if i+1 > math.MaxUint16 {
 		return 0, false
 	}
 
-	a.internal[topic] = uint16(i) + 1
-	atomic.StoreUint32(&a.cursor, i+1)
 	return uint16(i) + 1, false
+}
+
+// register records an alias value previously returned by peek for a topic.
+// The caller must hold the lock.
+func (a *OutboundTopicAliases) register(topic string, alias uint16) {
+	a.internal[topic] = alias
+	atomic.StoreUint32(&a.cursor, uint32(alias))
 }
 
 // SharedSubscriptions contains a map of subscriptions to a shared filter,

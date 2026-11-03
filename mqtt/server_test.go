@@ -2050,6 +2050,43 @@ func TestPublishToClientServerTopicAlias(t *testing.T) {
 	require.Equal(t, append(pk1, pk2...), ret)
 }
 
+func TestPublishToClientServerTopicAliasNotRegisteredWhenTooLarge(t *testing.T) {
+	s := newServer()
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	cl.Properties.Props.TopicAliasMaximum = 5
+	cl.Properties.Props.MaximumPacketSize = 64
+	s.Clients.Add(cl)
+
+	big := packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Publish},
+		TopicName:   "a/b/c",
+		Payload:     make([]byte, 128),
+	}
+	small := big.Copy(false)
+	small.Payload = []byte("hello")
+
+	go func() {
+		_, _ = s.publishToClient(cl, packets.Subscription{Filter: big.TopicName}, big, false)
+		_, _ = s.publishToClient(cl, packets.Subscription{Filter: small.TopicName}, small, false)
+		time.Sleep(time.Millisecond)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+
+	// only the small packet is delivered, carrying both the topic name and the alias.
+	got := packets.Packet{ProtocolVersion: 5}
+	require.NoError(t, got.FixedHeader.Decode(buf[0]))
+	require.Equal(t, packets.Publish, got.FixedHeader.Type)
+	require.NoError(t, got.PublishDecode(buf[2:]))
+	require.Equal(t, "a/b/c", got.TopicName)
+	require.Equal(t, uint16(1), got.Properties.TopicAlias)
+	require.Equal(t, []byte("hello"), got.Payload)
+	require.Len(t, buf, 2+int(buf[1]))
+}
+
 func TestPublishToClientMqtt3RetainFalseLeverageNoConn(t *testing.T) {
 	s := newServer()
 	cl, _, _ := newTestClient()

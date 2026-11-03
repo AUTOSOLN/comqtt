@@ -1110,17 +1110,6 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		out.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9]
 	}
 
-	if cl.Properties.Props.TopicAliasMaximum > 0 {
-		var aliasExists bool
-		out.Properties.TopicAlias, aliasExists = cl.State.TopicAliases.Outbound.Set(pk.TopicName)
-		if out.Properties.TopicAlias > 0 {
-			out.Properties.TopicAliasFlag = true
-			if aliasExists {
-				out.TopicName = ""
-			}
-		}
-	}
-
 	if out.FixedHeader.Qos > 0 {
 		if direct {
 			// Shutdown direct-write path: skip inflight tracking and the send-quota

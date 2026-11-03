@@ -1051,6 +1051,7 @@ func TestServerSendConnackMqtt3ReturnCodes(t *testing.T) {
 		reason packets.Code
 		want   []byte // nil: closed without a CONNACK
 	}{
+		{desc: "invalid protocol name", reason: packets.ErrProtocolViolationProtocolName, want: []byte{packets.Connack << 4, 2, 0, 0x01}},
 		{desc: "unsupported protocol version", reason: packets.ErrProtocolViolationProtocolVersion, want: []byte{packets.Connack << 4, 2, 0, 0x01}},
 		{desc: "client identifier too long", reason: packets.ErrClientIdentifierTooLong, want: []byte{packets.Connack << 4, 2, 0, 0x02}},
 		{desc: "server shutting down", reason: packets.ErrServerShuttingDown, want: []byte{packets.Connack << 4, 2, 0, 0x03}},

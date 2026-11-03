@@ -142,6 +142,7 @@ var (
 	// Maximum QoS or Retain Available), so the v3 client is closed without a CONNACK.
 	V5CodesToV3 = map[Code]Code{
 		ErrUnsupportedProtocolVersion:       Err3UnsupportedProtocolVersion,
+		ErrProtocolViolationProtocolName:    Err3UnsupportedProtocolVersion, // [MQTT-3.1.2-1]
 		ErrProtocolViolationProtocolVersion: Err3UnsupportedProtocolVersion, // [MQTT-3.1.2-2]
 		ErrClientIdentifierNotValid:         Err3ClientIdentifierNotValid,
 		ErrClientIdentifierTooLong:          Err3ClientIdentifierNotValid,

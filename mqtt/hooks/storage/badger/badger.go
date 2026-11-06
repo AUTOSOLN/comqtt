@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/wind-c/comqtt/v2/mqtt"
@@ -39,8 +40,8 @@ func retainedKey(topic string) string {
 }
 
 // inflightKeyPrefix returns the primary-key prefix shared by every inflight
-// message stored for a given client id, so a by-cid lookup can be expressed as
-// a prefix match on storage.Message.ID without a dedicated recipient field.
+// message stored for a given client id. Also matches ids that extend cid with
+// ':', so filter with inflightClientID.
 func inflightKeyPrefix(cid string) string {
 	return storage.InflightKey + "_" + cid + ":"
 }
@@ -48,6 +49,20 @@ func inflightKeyPrefix(cid string) string {
 // inflightKey returns a primary key for an inflight message.
 func inflightKey(cl *mqtt.Client, pk packets.Packet) string {
 	return inflightKeyPrefix(cl.ID) + pk.FormatID()
+}
+
+// inflightClientID returns the client id from an inflightKey key (everything before
+// the last ':', since packet ids are numeric), or "" if the key is malformed.
+func inflightClientID(key string) string {
+	rest, ok := strings.CutPrefix(key, storage.InflightKey+"_")
+	if !ok {
+		return ""
+	}
+	i := strings.LastIndex(rest, ":")
+	if i < 0 {
+		return ""
+	}
+	return rest[:i]
 }
 
 // sysInfoKey returns a primary key for system info.
@@ -76,6 +91,7 @@ func (h *Hook) ID() string {
 // Provides indicates which hook methods this hook provides.
 func (h *Hook) Provides(b byte) bool {
 	return bytes.Contains([]byte{
+		mqtt.OnSessionEstablish,
 		mqtt.OnSessionEstablished,
 		mqtt.OnDisconnect,
 		mqtt.OnSubscribed,
@@ -87,6 +103,7 @@ func (h *Hook) Provides(b byte) bool {
 		mqtt.OnQosDropped,
 		mqtt.OnSysInfoTick,
 		mqtt.OnClientExpired,
+		mqtt.OnSessionDiscarded,
 		mqtt.OnRetainedExpired,
 		mqtt.StoredClients,
 		mqtt.StoredInflightMessages,
@@ -133,6 +150,20 @@ func (h *Hook) Stop() error {
 	return h.db.Close()
 }
 
+// OnSessionEstablish deletes the previous session's inflight messages on a clean start [MQTT-3.1.2-4].
+func (h *Hook) OnSessionEstablish(cl *mqtt.Client, pk packets.Packet) {
+	if h.db == nil {
+		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+		return
+	}
+
+	if pk.Connect.Clean {
+		if err := h.deleteInflights(cl.ID); err != nil {
+			h.Log.Error("failed to delete client inflight data", "error", err, "id", cl.ID)
+		}
+	}
+}
+
 // OnSessionEstablished adds a client to the store when their session is established.
 func (h *Hook) OnSessionEstablished(cl *mqtt.Client, pk packets.Packet) {
 	h.updateClient(cl)
@@ -160,15 +191,16 @@ func (h *Hook) updateClient(cl *mqtt.Client) {
 		Clean:           cl.Properties.Clean,
 		ProtocolVersion: cl.Properties.ProtocolVersion,
 		Properties: storage.ClientProperties{
-			SessionExpiryInterval: props.SessionExpiryInterval,
-			AuthenticationMethod:  props.AuthenticationMethod,
-			AuthenticationData:    props.AuthenticationData,
-			RequestProblemInfo:    props.RequestProblemInfo,
-			RequestResponseInfo:   props.RequestResponseInfo,
-			ReceiveMaximum:        props.ReceiveMaximum,
-			TopicAliasMaximum:     props.TopicAliasMaximum,
-			User:                  props.User,
-			MaximumPacketSize:     props.MaximumPacketSize,
+			SessionExpiryInterval:     props.SessionExpiryInterval,
+			SessionExpiryIntervalFlag: props.SessionExpiryIntervalFlag,
+			AuthenticationMethod:      props.AuthenticationMethod,
+			AuthenticationData:        props.AuthenticationData,
+			RequestProblemInfo:        props.RequestProblemInfo,
+			RequestResponseInfo:       props.RequestResponseInfo,
+			ReceiveMaximum:            props.ReceiveMaximum,
+			TopicAliasMaximum:         props.TopicAliasMaximum,
+			User:                      props.User,
+			MaximumPacketSize:         props.MaximumPacketSize,
 		},
 		Will: storage.ClientWill(cl.Properties.Will),
 	}
@@ -186,13 +218,15 @@ func (h *Hook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 		return
 	}
 
-	h.updateClient(cl)
-
-	if !expire {
+	// a taken-over copy's row belongs to the new owner (written by
+	// OnSessionEstablished, or deleted by the broker), so don't write it back.
+	if cl.StopCause() == packets.ErrSessionTakenOver {
 		return
 	}
 
-	if cl.StopCause() == packets.ErrSessionTakenOver {
+	h.updateClient(cl)
+
+	if !expire {
 		return
 	}
 
@@ -211,6 +245,9 @@ func (h *Hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []by
 
 	var in *storage.Subscription
 	for i := 0; i < len(pk.Filters); i++ {
+		if reasonCodes[i] >= 0x80 { // refused filter; it was never subscribed or counted
+			continue
+		}
 		in = &storage.Subscription{
 			ID:     subscriptionKey(cl, pk.Filters[i].Filter),
 			T:      storage.SubscriptionKey,
@@ -245,6 +282,36 @@ func (h *Hook) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []
 			h.Log.Error("failed to delete subscription data", "error", err, "data", subscriptionKey(cl, pk.Filters[i].Filter))
 		}
 	}
+}
+
+// DeleteSession removes the client row, subscription rows and inflight rows for
+// a client id outside the hook lifecycle (e.g. the broker's session-expiry apply).
+// It fires no hooks and touches no server state. It is idempotent: it returns
+// nil if nothing is stored for the id.
+func (h *Hook) DeleteSession(clientID string) error {
+	if h.db == nil {
+		return storage.ErrDBFileNotOpen
+	}
+
+	err := h.db.Delete(clientID, new(storage.Client))
+	if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
+		return err
+	}
+
+	subs, err := h.StoredSubscriptionsByCid(clientID)
+	if err != nil {
+		return err
+	}
+	// full scan of subscription rows per call (no index on Client); add one, or a
+	// batched delete, if the discard volume at startup makes it matter.
+	for _, sub := range subs {
+		err = h.db.Delete(sub.ID, new(storage.Subscription))
+		if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
+			return err
+		}
+	}
+
+	return h.deleteInflights(clientID)
 }
 
 // OnRetainMessage adds a retained message for a topic to the store.
@@ -380,7 +447,24 @@ func (h *Hook) OnRetainedExpired(filter string) {
 	}
 }
 
-// OnClientExpired deleted expired clients from the store.
+// deleteInflights deletes every stored inflight message for the client id and
+// returns the first error.
+func (h *Hook) deleteInflights(cid string) error {
+	msgs, err := h.StoredInflightMessagesByCid(cid)
+	if err != nil {
+		return err
+	}
+
+	for _, m := range msgs {
+		if err = h.db.Delete(m.ID, new(storage.Message)); err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// OnClientExpired deletes expired clients and their inflight messages from the store.
 func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	if h.db == nil {
 		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
@@ -390,6 +474,23 @@ func (h *Hook) OnClientExpired(cl *mqtt.Client) {
 	err := h.db.Delete(clientKey(cl), new(storage.Client))
 	if err != nil {
 		h.Log.Error("failed to delete expired client data", "error", err, "id", clientKey(cl))
+	}
+
+	if err := h.deleteInflights(cl.ID); err != nil {
+		h.Log.Error("failed to delete client inflight data", "error", err, "id", cl.ID)
+	}
+}
+
+// OnSessionDiscarded deletes a dead session's client, subscription and inflight rows
+// when the server discards it at startup.
+func (h *Hook) OnSessionDiscarded(cl *mqtt.Client) {
+	if h.db == nil {
+		h.Log.Error("", "error", storage.ErrDBFileNotOpen)
+		return
+	}
+
+	if err := h.DeleteSession(cl.ID); err != nil {
+		h.Log.Error("failed to delete discarded session", "error", err, "id", cl.ID)
 	}
 }
 
@@ -450,6 +551,10 @@ func (h *Hook) StoredInflightMessages() (v []storage.Message, err error) {
 		return
 	}
 
+	for i := range v {
+		v[i].ClientID = inflightClientID(v[i].ID)
+	}
+
 	return v, nil
 }
 
@@ -494,6 +599,11 @@ func (h *Hook) StoredInflightMessagesByCid(cid string) (v []storage.Message, err
 	if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
 		return
 	}
+
+	// the prefix for "a" also matches "a:b"'s rows
+	v = slices.DeleteFunc(v, func(m storage.Message) bool {
+		return inflightClientID(m.ID) != cid
+	})
 
 	return v, nil
 }

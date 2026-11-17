@@ -142,7 +142,41 @@ func (h *Hook) Init(config any) error {
 		return err
 	}
 
-	return nil
+	return h.backfillSubscriptionIndex()
+}
+
+// subscriptionIndexMarkerKey marks a store whose subscription rows all have Client
+// index entries. Its own type keeps it out of the Stored* queries.
+const subscriptionIndexMarkerKey = "subscription_client_index"
+
+type subscriptionIndexMarker struct {
+	Done bool // gob can't encode a struct with no exported fields
+}
+
+// backfillSubscriptionIndex re-upserts every subscription once, so rows written
+// before Subscription.Client was indexed get index entries. Indexed queries would
+// silently miss them otherwise. A crash before the marker is written reruns it.
+func (h *Hook) backfillSubscriptionIndex() error {
+	err := h.db.Get(subscriptionIndexMarkerKey, new(subscriptionIndexMarker))
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, badgerhold.ErrNotFound) {
+		return err
+	}
+
+	var subs []storage.Subscription
+	if err = h.db.Find(&subs, nil); err != nil {
+		return err
+	}
+	for _, sub := range subs {
+		if err = h.db.Upsert(sub.ID, sub); err != nil {
+			return err
+		}
+	}
+	h.Log.Info("backfilled subscription client index", "count", len(subs))
+
+	return h.db.Upsert(subscriptionIndexMarkerKey, subscriptionIndexMarker{Done: true})
 }
 
 // Stop closes the badger instance.
@@ -302,8 +336,6 @@ func (h *Hook) DeleteSession(clientID string) error {
 	if err != nil {
 		return err
 	}
-	// full scan of subscription rows per call (no index on Client); add one, or a
-	// batched delete, if the discard volume at startup makes it matter.
 	for _, sub := range subs {
 		err = h.db.Delete(sub.ID, new(storage.Subscription))
 		if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
@@ -580,7 +612,7 @@ func (h *Hook) StoredSubscriptionsByCid(cid string) (v []storage.Subscription, e
 		return
 	}
 
-	err = h.db.Find(&v, badgerhold.Where("T").Eq(storage.SubscriptionKey).And("Client").Eq(cid))
+	err = h.db.Find(&v, badgerhold.Where("Client").Eq(cid).And("T").Eq(storage.SubscriptionKey).Index("Client"))
 	if err != nil && !errors.Is(err, badgerhold.ErrNotFound) {
 		return
 	}

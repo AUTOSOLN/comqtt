@@ -153,7 +153,7 @@ func (d *Message) ToPacket() packets.Packet {
 type Subscription struct {
 	T                 string `json:"t,omitempty"`
 	ID                string `json:"id,omitempty" storm:"id"`
-	Client            string `json:"client,omitempty"`
+	Client            string `json:"client,omitempty" badgerhold:"index"`
 	Filter            string `json:"filter,omitempty"`
 	Identifier        int    `json:"identifier,omitempty"`
 	RetainHandling    byte   `json:"retain_handling,omitempty"`

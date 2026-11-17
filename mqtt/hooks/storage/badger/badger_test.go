@@ -1094,6 +1094,87 @@ func TestStoredByCidSurvivesRestart(t *testing.T) {
 	require.Equal(t, []byte("queued"), msgs[0].Payload)
 }
 
+// badgerhold keys rows by bare type name and reads index tags from top-level fields
+// only (store.go newStorer), so this wrapper shares storage.Subscription's rows and
+// JSON encoding but gets no index entries.
+func writeUnindexedSubscriptions(t *testing.T, dir string, cid string, filters ...string) {
+	type Subscription struct{ storage.Subscription }
+
+	options := badgerhold.DefaultOptions
+	options.Dir = dir
+	options.ValueDir = dir
+	db, err := badgerhold.Open(options)
+	require.NoError(t, err)
+	for _, f := range filters {
+		id := subscriptionKey(&mqtt.Client{ID: cid}, f)
+		require.NoError(t, db.Upsert(id, Subscription{storage.Subscription{T: storage.SubscriptionKey, ID: id, Client: cid, Filter: f}}))
+	}
+
+	var indexed []storage.Subscription
+	require.NoError(t, db.Find(&indexed, badgerhold.Where("Client").Eq(cid).Index("Client")))
+	require.Empty(t, indexed, "rows should have no index entries before the backfill")
+	require.NoError(t, db.Close())
+}
+
+func TestInitBackfillsSubscriptionIndex(t *testing.T) {
+	dir := t.TempDir()
+	writeUnindexedSubscriptions(t, dir, "old", "x/1", "x/2")
+
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	require.NoError(t, h.Init(&Options{Path: dir}))
+	defer teardown(t, dir, h)
+
+	subs, err := h.StoredSubscriptionsByCid("old")
+	require.NoError(t, err)
+	require.Len(t, subs, 2)
+
+	require.NoError(t, h.DeleteSession("old"))
+	all, err := h.StoredSubscriptions()
+	require.NoError(t, err)
+	require.Empty(t, all)
+}
+
+func TestInitBackfillRunsOnce(t *testing.T) {
+	dir := t.TempDir()
+
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	require.NoError(t, h.Init(&Options{Path: dir}))
+	require.NoError(t, h.Stop())
+
+	// written after the marker, so only a second backfill would index it
+	writeUnindexedSubscriptions(t, dir, "late", "x/1")
+
+	restarted := new(Hook)
+	restarted.SetOpts(logger, nil)
+	require.NoError(t, restarted.Init(&Options{Path: dir}))
+	defer teardown(t, dir, restarted)
+
+	subs, err := restarted.StoredSubscriptionsByCid("late")
+	require.NoError(t, err)
+	require.Empty(t, subs)
+}
+
+func TestSubscriptionIndexMarkerNotStored(t *testing.T) {
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	require.NoError(t, h.Init(&Options{Path: t.TempDir()}))
+	defer teardown(t, h.config.Path, h)
+
+	require.NoError(t, h.db.Get(subscriptionIndexMarkerKey, new(subscriptionIndexMarker)))
+
+	subs, err := h.StoredSubscriptions()
+	require.NoError(t, err)
+	require.Empty(t, subs)
+	clients, err := h.StoredClients()
+	require.NoError(t, err)
+	require.Empty(t, clients)
+	msgs, err := h.StoredInflightMessages()
+	require.NoError(t, err)
+	require.Empty(t, msgs)
+}
+
 // TestServerRestartLoadsStoredState writes rows through the hook the way the server
 // would, then restarts a real server on them, so the hook and the loaders are checked
 // against each other rather than each against a fake.

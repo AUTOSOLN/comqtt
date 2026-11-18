@@ -331,3 +331,34 @@ func TestCopyPropertiesNoTransfer(t *testing.T) {
 	// Properties which should never be transferred from one connection to another
 	require.Equal(t, uint16(0), pkB.TopicAlias)
 }
+
+func TestDecodePropertiesDuplicateContentType(t *testing.T) {
+	b := bytes.NewBuffer([]byte{8, 3, 0, 1, 'a', 3, 0, 1, 'b'})
+	props := new(Properties)
+	_, err := props.Decode(Publish, b)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrProtocolViolationDuplicateProperty)
+}
+
+func TestDecodePropertiesDuplicateUserAllowed(t *testing.T) {
+	b := bytes.NewBuffer([]byte{14, 38, 0, 1, 'a', 0, 1, 'b', 38, 0, 1, 'c', 0, 1, 'd'})
+	props := new(Properties)
+	_, err := props.Decode(Publish, b)
+	require.NoError(t, err)
+	require.Len(t, props.User, 2)
+}
+
+func TestDecodePropertiesDuplicateSubIDPublishAllowed(t *testing.T) {
+	b := bytes.NewBuffer([]byte{4, 11, 1, 11, 2})
+	props := new(Properties)
+	_, err := props.Decode(Publish, b)
+	require.NoError(t, err)
+	require.Equal(t, []int{1, 2}, props.SubscriptionIdentifier)
+}
+
+func TestDecodePropertiesDuplicateSubIDSubscribe(t *testing.T) {
+	b := bytes.NewBuffer([]byte{4, 11, 1, 11, 2})
+	props := new(Properties)
+	_, err := props.Decode(Subscribe, b)
+	require.ErrorIs(t, err, ErrProtocolViolationDuplicateProperty)
+}

@@ -293,6 +293,29 @@ func TestClientClearInflights(t *testing.T) {
 	require.Equal(t, int64(3), atomic.LoadInt64(&cl.ops.info.InflightDropped))
 }
 
+func TestClientClearAllInflightsInMemoryOnly(t *testing.T) {
+	tt := []struct {
+		counted bool
+		want    int64
+	}{
+		{counted: true, want: 0},
+		{counted: false, want: 3},
+	}
+
+	for _, tx := range tt {
+		cl, _, _ := newTestClient()
+		cl.State.Inflight.Set(packets.Packet{PacketID: 1})
+		cl.State.Inflight.Set(packets.Packet{PacketID: 2})
+		cl.State.InboundInflight.Set(packets.Packet{PacketID: 3})
+		atomic.StoreInt64(&cl.ops.info.Inflight, 3)
+
+		cl.ClearAllInflightsInMemoryOnly(tx.counted)
+		require.Equal(t, 0, cl.State.Inflight.Len())
+		require.Equal(t, 0, cl.State.InboundInflight.Len())
+		require.Equal(t, tx.want, atomic.LoadInt64(&cl.ops.info.Inflight))
+	}
+}
+
 func TestClientResendInflightMessages(t *testing.T) {
 	pk1 := packets.TPacketData[packets.Puback].Get(packets.TPuback)
 	cl, r, w := newTestClient()

@@ -90,6 +90,7 @@ type Message struct {
 	Created     int64               `json:"created"`                 // the time the message was created in unixtime
 	Sent        int64               `json:"sent,omitempty"`          // the last time the message was sent (for retries) in unixtime (if inflight)
 	PacketID    uint16              `json:"packet_id"`               // the unique id of the packet (if inflight)
+	ClientID    string              `json:"-"`                       // the client the inflight message is queued for; filled by storage hooks on read, never stored
 }
 
 // MessageProperties contains a limited subset of mqtt v5 properties specific to publish messages.
@@ -152,7 +153,7 @@ func (d *Message) ToPacket() packets.Packet {
 type Subscription struct {
 	T                 string `json:"t,omitempty"`
 	ID                string `json:"id,omitempty" storm:"id"`
-	Client            string `json:"client,omitempty"`
+	Client            string `json:"client,omitempty" badgerhold:"index"`
 	Filter            string `json:"filter,omitempty"`
 	Identifier        int    `json:"identifier,omitempty"`
 	RetainHandling    byte   `json:"retain_handling,omitempty"`

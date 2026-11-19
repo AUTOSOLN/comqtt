@@ -1306,6 +1306,69 @@ func TestServerPublishAndReceive(t *testing.T) {
 	require.Equal(t, packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).RawBytes, <-receiverBuf)
 }
 
+func TestServerPublishNotCountedAsReceived(t *testing.T) {
+	s := newServerWithInlineClient()
+	defer s.Close()
+
+	pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).Packet
+	err := s.Publish(pkx.TopicName, pkx.Payload, pkx.FixedHeader.Retain, pkx.FixedHeader.Qos)
+	require.NoError(t, err)
+
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.MessagesReceived))
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.PacketsReceived))
+}
+
+func TestInjectPacketNonInlineCountedAsReceived(t *testing.T) {
+	s := newServer()
+	defer s.Close()
+
+	cl, _, _ := newTestClient()
+	s.Clients.Add(cl)
+
+	err := s.InjectPacket(cl, *packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).Packet)
+	require.NoError(t, err)
+
+	// newTestClient gives the client its own system.Info, not s.Info.
+	require.Equal(t, int64(1), atomic.LoadInt64(&cl.ops.info.MessagesReceived))
+	require.Equal(t, int64(1), atomic.LoadInt64(&cl.ops.info.PacketsReceived))
+}
+
+func TestServerPublishToSubscriberCountsSentNotReceived(t *testing.T) {
+	s := newServerWithInlineClient()
+	_ = s.Serve()
+	defer s.Close()
+
+	receiver, r2, w2 := newTestClient()
+	receiver.ID = "receiver"
+	s.Clients.Add(receiver)
+	s.Topics.Subscribe(receiver.ID, packets.Subscription{Filter: "a/b/c"})
+
+	receiverBuf := make(chan []byte)
+	go func() {
+		buf, err := io.ReadAll(r2)
+		require.NoError(t, err)
+		receiverBuf <- buf
+	}()
+
+	go func() {
+		pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).Packet
+		err := s.Publish(pkx.TopicName, pkx.Payload, pkx.FixedHeader.Retain, pkx.FixedHeader.Qos)
+		require.NoError(t, err)
+		time.Sleep(time.Millisecond * 10)
+		_ = w2.Close()
+	}()
+
+	require.Equal(t, packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).RawBytes, <-receiverBuf)
+
+	// newTestClient gives the receiver its own system.Info, so sent counts land there.
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt64(&receiver.ops.info.MessagesSent) == 1
+	}, time.Second, 5*time.Millisecond)
+
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.MessagesReceived))
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.PacketsReceived))
+}
+
 func TestServerPublishNoInlineClient(t *testing.T) {
 	s := newServer()
 	pkx := *packets.TPacketData[packets.Publish].Get(packets.TPublishBasic).Packet
@@ -1644,24 +1707,27 @@ func TestServerProcessPublishACLCheckDeny(t *testing.T) {
 			cl.Properties.ProtocolVersion = tx.protocolVersion
 			s.Clients.Add(cl)
 
+			var pubErr error
 			wg := sync.WaitGroup{}
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				err := s.processPublish(cl, tx.pk)
-				require.ErrorIs(t, err, tx.expectErr)
+				pubErr = s.processPublish(cl, tx.pk)
 				_ = w.Close()
 			}()
 
 			buf, err := io.ReadAll(r)
 			require.NoError(t, err)
 
+			// ReadAll returns once Stop closes the conn, before Closed() is set, so wait for processPublish.
+			wg.Wait()
+			require.ErrorIs(t, pubErr, tx.expectErr)
+
 			if tx.expectReponse != nil {
 				require.Equal(t, tx.expectReponse, buf)
 			}
 
 			require.Equal(t, tx.expectDisconnect, cl.Closed())
-			wg.Wait()
 		})
 	}
 }

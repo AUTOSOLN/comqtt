@@ -1,0 +1,114 @@
+version: '3'
+
+# Run `task --list` to see everything here.
+
+tasks:
+  build:
+    desc: Compile all packages (what CI runs)
+    cmds:
+      - go build ./...
+
+  build:bin:
+    desc: Build the single and cluster binaries into ./bin
+    cmds:
+      - go build -o bin/comqtt ./cmd/single
+      - go build -o bin/comqtt-cluster ./cmd/cluster
+
+  test:
+    desc: Run all tests (mysql/postgres auth tests need `task deps:up` first)
+    cmds:
+      - go test ./... {{.CLI_ARGS}}
+
+  test:pkg:
+    desc: "Test one package, e.g. `task test:pkg -- ./mqtt/...`"
+    cmds:
+      - go test -v {{.CLI_ARGS}}
+
+  test:cover:
+    desc: Run tests with coverage summary
+    cmds:
+      - go test -cover ./...
+
+  test:race:
+    desc: Run tests with the race detector
+    cmds:
+      - go test -race ./...
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  fmt:
+    desc: Format all Go code
+    cmds:
+      - gofmt -w -l .
+
+  fmt:check:
+    desc: Fail if any Go code is unformatted (does not rewrite files)
+    cmds:
+      - test -z "$(gofmt -l mqtt cluster plugin cmd config)" || (gofmt -l mqtt cluster plugin cmd config; exit 1)
+
+  vuln:
+    desc: Run govulncheck (pinned version)
+    cmds:
+      - go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  check:full:
+    desc: Is this branch healthy? (starts test DBs via Docker, then fmt check, vet, build, race tests)
+    deps: [deps:up]
+    cmds:
+      - task: fmt:check
+      - task: vet
+      - task: build
+      - task: test:race
+
+  tidy:
+    desc: Tidy go.mod/go.sum
+    cmds:
+      - go mod tidy
+
+  run:single:
+    desc: "Run the standalone broker (TCP :1883, WS :1882, HTTP :8080). Extra flags after --"
+    cmds:
+      - go run ./cmd/single --conf=./cmd/config/single.yml {{.CLI_ARGS}}
+
+  run:cluster:
+    desc: "Run cluster node N (1-3) using cmd/config/nodeN.yml; needs Redis on :6379. e.g. `task run:cluster N=2`"
+    vars:
+      N: '{{.N | default "1"}}'
+    cmds:
+      - go run ./cmd/cluster --conf=./cmd/config/node{{.N}}.yml {{.CLI_ARGS}}
+
+  deps:up:
+    desc: Start MySQL and Postgres test databases (docker compose)
+    cmds:
+      - docker compose up -d
+      - until docker exec mysql mysqladmin ping -h 127.0.0.1 --silent; do echo 'waiting for mysql...'; sleep 3; done
+      - until docker exec postgresql pg_isready -U postgres -q; do echo 'waiting for postgresql...'; sleep 3; done
+
+  deps:down:
+    desc: Stop the test databases
+    cmds:
+      - docker compose down
+
+  deps:down:volumes:
+    desc: Stop the test databases and remove their volumes (wipes DB data)
+    cmds:
+      - docker compose down -v
+
+  docker:build:
+    desc: Build the comqtt Docker image
+    cmds:
+      - docker build -t comqtt:latest .
+
+  docker:run:
+    desc: Run the comqtt Docker image (single mode)
+    cmds:
+      - docker run --rm -p 1883:1883 -p 1882:1882 -p 8080:8080 comqtt:latest
+
+  proto:
+    desc: Regenerate cluster gRPC code from service.proto (needs protoc + protoc-gen-go)
+    dir: cluster/rpc
+    cmds:
+      - protoc service.proto --go_out=plugins=grpc:. --go_opt=paths=source_relative

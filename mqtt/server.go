@@ -836,6 +836,7 @@ func (s *Server) Unsubscribe(filter string, subscriptionId int) error {
 
 // InjectPacket injects a packet into the broker as if it were sent from the specified client.
 // InlineClients using this method can publish packets to any topic (including $SYS) and bypass ACL checks.
+// Packets from inline clients are not counted in the received counters.
 func (s *Server) InjectPacket(cl *Client, pk packets.Packet) error {
 	pk.ProtocolVersion = cl.Properties.ProtocolVersion
 
@@ -844,9 +845,11 @@ func (s *Server) InjectPacket(cl *Client, pk packets.Packet) error {
 		return err
 	}
 
-	atomic.AddInt64(&cl.ops.info.PacketsReceived, 1)
-	if pk.FixedHeader.Type == packets.Publish {
-		atomic.AddInt64(&cl.ops.info.MessagesReceived, 1)
+	if !cl.Net.Inline {
+		atomic.AddInt64(&cl.ops.info.PacketsReceived, 1)
+		if pk.FixedHeader.Type == packets.Publish {
+			atomic.AddInt64(&cl.ops.info.MessagesReceived, 1)
+		}
 	}
 
 	return nil
@@ -1108,17 +1111,6 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 
 	if out.FixedHeader.Qos > s.Options.Capabilities.MaximumQos {
 		out.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9]
-	}
-
-	if cl.Properties.Props.TopicAliasMaximum > 0 {
-		var aliasExists bool
-		out.Properties.TopicAlias, aliasExists = cl.State.TopicAliases.Outbound.Set(pk.TopicName)
-		if out.Properties.TopicAlias > 0 {
-			out.Properties.TopicAliasFlag = true
-			if aliasExists {
-				out.TopicName = ""
-			}
-		}
 	}
 
 	if out.FixedHeader.Qos > 0 {
@@ -1427,6 +1419,18 @@ func (s *Server) processUnsubscribe(cl *Client, pk packets.Packet) error {
 	for i, sub := range pk.Filters {       // [MQTT-3.10.4-6] [MQTT-3.11.3-1]
 		if code != packets.CodeSuccess {
 			reasonCodes[i] = code.Code // NB 3.11.3 Non-normative 0x91
+			continue
+		}
+
+		// Unsubscribing requires the same (read) permission as subscribing, so a
+		// client can't remove subscriptions on filters it isn't authorized for.
+		// MQTT3 UNSUBACK carries no reason codes, so a denied filter there is
+		// simply left subscribed.
+		if !s.hooks.OnACLCheck(cl, sub.Filter, false) {
+			reasonCodes[i] = packets.ErrNotAuthorized.Code
+			if s.Options.Capabilities.Compatibilities.ObscureNotAuthorized {
+				reasonCodes[i] = packets.ErrUnspecifiedError.Code
+			}
 			continue
 		}
 

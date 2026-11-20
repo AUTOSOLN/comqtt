@@ -90,6 +90,7 @@ var (
 	ErrProtocolViolationOversizeSubID         = Code{Code: 0x82, Reason: "protocol violation: oversize subscription id"}
 	ErrProtocolViolationDupNoQos              = Code{Code: 0x82, Reason: "protocol violation: dup true with no qos"}
 	ErrProtocolViolationUnsupportedProperty   = Code{Code: 0x82, Reason: "protocol violation: unsupported property"}
+	ErrProtocolViolationDuplicateProperty     = Code{Code: 0x82, Reason: "protocol violation: duplicate property"}
 	ErrProtocolViolationNoTopic               = Code{Code: 0x82, Reason: "protocol violation: no topic or alias"}
 	ErrImplementationSpecificError            = Code{Code: 0x83, Reason: "implementation specific error"}
 	ErrRejectPacket                           = Code{Code: 0x83, Reason: "packet rejected"}
@@ -139,12 +140,14 @@ var (
 	// This is required because MQTTv3 has different return byte specification.
 	// See http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc385349257
 	V5CodesToV3 = map[Code]Code{
-		ErrUnsupportedProtocolVersion: Err3UnsupportedProtocolVersion,
-		ErrClientIdentifierNotValid:   Err3ClientIdentifierNotValid,
-		ErrServerUnavailable:          Err3ServerUnavailable,
-		ErrMalformedUsername:          ErrMalformedUsernameOrPassword,
-		ErrMalformedPassword:          ErrMalformedUsernameOrPassword,
-		ErrBadUsernameOrPassword:      Err3NotAuthorized,
+		ErrUnsupportedProtocolVersion:       Err3UnsupportedProtocolVersion,
+		ErrProtocolViolationProtocolName:    Err3UnsupportedProtocolVersion,
+		ErrProtocolViolationProtocolVersion: Err3UnsupportedProtocolVersion,
+		ErrClientIdentifierNotValid:         Err3ClientIdentifierNotValid,
+		ErrServerUnavailable:                Err3ServerUnavailable,
+		ErrMalformedUsername:                ErrMalformedUsernameOrPassword,
+		ErrMalformedPassword:                ErrMalformedUsernameOrPassword,
+		ErrBadUsernameOrPassword:            Err3NotAuthorized,
 		// MQTTv3 has no distinct "busy" return code, so a v5 ErrServerBusy
 		// CONNACK downgrades to "server unavailable" for v3 clients.
 		ErrServerBusy: Err3ServerUnavailable,

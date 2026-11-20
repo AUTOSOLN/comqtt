@@ -771,6 +771,18 @@ func TestIsValid(t *testing.T) {
 	require.False(t, IsValidFilter(SharePrefix+"/#", false))
 	require.False(t, IsValidFilter(SharePrefix+"/#/", false))
 	require.False(t, IsValidFilter("a/#/c", false))
+	require.True(t, IsValidFilter("+", false))
+	require.True(t, IsValidFilter("#", false))
+	require.True(t, IsValidFilter("+/a/+/#", false))
+	require.True(t, IsValidFilter(SharePrefix+"/grp/a/+/#", false))
+	require.False(t, IsValidFilter("a/+b", false))
+	require.False(t, IsValidFilter("a/b+", false))
+	require.False(t, IsValidFilter("+a", false))
+	require.False(t, IsValidFilter("a/++", false))
+	require.False(t, IsValidFilter("a#", false))
+	require.False(t, IsValidFilter("a/b#", false))
+	require.False(t, IsValidFilter("a/+#", false))
+	require.False(t, IsValidFilter(SharePrefix+"/grp/a/+b", false))
 }
 
 func TestIsValidForPublish(t *testing.T) {

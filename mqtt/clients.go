@@ -554,6 +554,28 @@ func (cl *Client) WritePacket(pk packets.Packet) error {
 
 	pk = cl.ops.hooks.OnPacketEncode(cl, pk)
 
+	// Outbound topic aliases are assigned at write time, and a new alias is only
+	// registered once the packet is known to be deliverable, so that the client
+	// never receives an alias-only publish for an alias it was not sent [MQTT-3.3.2-12].
+	// The lock is held until the write completes so that aliases reach the client in order.
+	var newAliasTopic string
+	if pk.FixedHeader.Type == packets.Publish && pk.ProtocolVersion == 5 && cl.Properties.Props.TopicAliasMaximum > 0 && pk.TopicName != "" {
+		aliases := cl.State.TopicAliases.Outbound
+		aliases.Lock()
+		defer aliases.Unlock()
+
+		alias, exists := aliases.peek(pk.TopicName)
+		if alias > 0 {
+			pk.Properties.TopicAlias = alias
+			pk.Properties.TopicAliasFlag = true
+			if exists {
+				pk.TopicName = ""
+			} else {
+				newAliasTopic = pk.TopicName
+			}
+		}
+	}
+
 	var err error
 	buf := new(bytes.Buffer)
 	switch pk.FixedHeader.Type {
@@ -596,6 +618,10 @@ func (cl *Client) WritePacket(pk packets.Packet) error {
 
 	if pk.Mods.MaxSize > 0 && uint32(buf.Len()) > pk.Mods.MaxSize {
 		return packets.ErrPacketTooLarge // [MQTT-3.1.2-24] [MQTT-3.1.2-25]
+	}
+
+	if newAliasTopic != "" {
+		cl.State.TopicAliases.Outbound.register(newAliasTopic, pk.Properties.TopicAlias)
 	}
 
 	nb := net.Buffers{buf.Bytes()}

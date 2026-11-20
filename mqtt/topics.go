@@ -85,6 +85,18 @@ func (a *OutboundTopicAliases) Set(topic string) (uint16, bool) {
 	a.Lock()
 	defer a.Unlock()
 
+	alias, exists := a.peek(topic)
+	if alias > 0 && !exists {
+		a.register(topic, alias)
+	}
+
+	return alias, exists
+}
+
+// peek returns the alias already registered for a topic, or the next unused alias
+// value if the topic has none, without registering it. A zero alias indicates that
+// no alias is available. The caller must hold the lock.
+func (a *OutboundTopicAliases) peek(topic string) (uint16, bool) {
 	if a.maximum == 0 {
 		return 0, false
 	}
@@ -95,13 +107,17 @@ func (a *OutboundTopicAliases) Set(topic string) (uint16, bool) {
 
 	i := atomic.LoadUint32(&a.cursor)
 	if i+1 > uint32(a.maximum) {
-		// if i+1 > math.MaxUint16 {
 		return 0, false
 	}
 
-	a.internal[topic] = uint16(i) + 1
-	atomic.StoreUint32(&a.cursor, i+1)
 	return uint16(i) + 1, false
+}
+
+// register records an alias value previously returned by peek for a topic.
+// The caller must hold the lock.
+func (a *OutboundTopicAliases) register(topic string, alias uint16) {
+	a.internal[topic] = alias
+	atomic.StoreUint32(&a.cursor, uint32(alias))
 }
 
 // SharedSubscriptions contains a map of subscriptions to a shared filter,
@@ -737,9 +753,15 @@ func IsValidFilter(filter string, forPublish bool) bool {
 		}
 	}
 
-	wildhash := strings.IndexRune(filter, '#')
-	if wildhash >= 0 && wildhash != len(filter)-1 { // [MQTT-4.7.1-2]
-		return false
+	levels := strings.Split(filter, "/")
+	for i, level := range levels {
+		if len(level) > 1 && strings.ContainsAny(level, "+#") {
+			return false // wildcards must occupy an entire level [MQTT-4.7.1-1] [MQTT-4.7.1-2]
+		}
+
+		if level == "#" && i != len(levels)-1 {
+			return false // multi-level wildcard must be the last level [MQTT-4.7.1-1]
+		}
 	}
 
 	prefix, hasNext := isolateParticle(filter, 0)

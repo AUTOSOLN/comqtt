@@ -115,6 +115,9 @@ func (h *Hook) Init(config any) error {
 	}
 
 	options := badgerhold.DefaultOptions
+	if h.config.Options != nil {
+		options = *h.config.Options
+	}
 	options.Dir = h.config.Path
 	options.ValueDir = h.config.Path
 	options.Logger = h

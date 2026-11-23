@@ -114,6 +114,26 @@ func TestInitUseDefaults(t *testing.T) {
 	require.Equal(t, defaultDbFile, h.config.Path)
 }
 
+func TestInitUsesBadgerOptions(t *testing.T) {
+	path := t.TempDir()
+	opts := badgerhold.DefaultOptions
+	opts.Options = opts.Options.WithMemTableSize(8 << 20).WithNumMemtables(2)
+	opts.Dir = "ignored"
+
+	h := new(Hook)
+	h.SetOpts(logger, nil)
+	err := h.Init(&Options{Path: path, Options: &opts})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, h.Stop()) }()
+
+	got := h.db.Badger().Opts()
+	require.Equal(t, int64(8<<20), got.MemTableSize)
+	require.Equal(t, 2, got.NumMemtables)
+	require.Equal(t, path, got.Dir, "Path must override Options.Dir")
+	require.Equal(t, path, got.ValueDir, "Path must override Options.ValueDir")
+	require.Equal(t, "ignored", opts.Dir, "Init must not modify the caller's options")
+}
+
 func TestOnSessionEstablishedThenOnDisconnect(t *testing.T) {
 	h := new(Hook)
 	h.SetOpts(logger, nil)
